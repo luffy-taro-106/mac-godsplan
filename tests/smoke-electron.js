@@ -2,9 +2,12 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { BrowserWindow, nativeImage, desktopCapturer, screen, safeStorage } = require('electron');
+const { BrowserWindow, nativeImage, desktopCapturer, screen, safeStorage, systemPreferences, dialog, clipboard, ClipboardItem, globalShortcut } = require('electron');
 const { Store } = require('../overlay/storage');
 const { setTimeout: delay } = require('node:timers/promises');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
+const runFile = promisify(execFile);
 
 async function until(predicate, timeoutMs = 8000) {
   const started = Date.now();
@@ -12,6 +15,7 @@ async function until(predicate, timeoutMs = 8000) {
 }
 exports.run = async runtime => {
   const results = [], consoleErrors = [];
+  const skip = (name, reason) => { results.push({ name, skipped: true, reason }); console.log(`SKIP ${name}: ${reason}`); };
   const test = async (name, action) => {
     try { await action(); results.push({ name, passed: true }); console.log(`PASS ${name}`); }
     catch (error) { results.push({ name, passed: false, error: error.message }); console.error(`FAIL ${name}: ${error.message}`); throw error; }
@@ -41,21 +45,23 @@ exports.run = async runtime => {
         fs.writeFileSync(path.join(work,'Overlay-preview.png'), capture.toPNG());
       } finally { win.setContentProtection(true); runtime.hideOverlay(); }
     });
-    await test('Windows topmost, close-to-tray, click-through and compact restoration', async () => {
+    await test('native topmost, close-to-tray, click-through and compact restoration', async () => {
       assert.equal(win.isAlwaysOnTop(),true);
       const other = new BrowserWindow({show:false,width:500,height:400});
       other.destroy(); assert.equal(win.isDestroyed(),false);
       runtime.showOverlay(false); assert.equal(win.isVisible(),true);
       win.close(); assert.equal(win.isDestroyed(),false); assert.equal(win.isVisible(),false);
-      runtime.showOverlay(false);
+      runtime.showOverlay(true);
+      await until(() => win.isFocused());
       runtime.togglePassThrough(); assert.equal(runtime.currentState().passThrough,true); assert.equal(win.isFocusable(),false);
+      if (process.platform === 'darwin') assert.equal(win.isFocused(), false, 'Click-through must release keyboard focus on macOS');
       runtime.togglePassThrough(); assert.equal(win.isFocusable(),true);
       const height = win.getBounds().height;
       runtime.toggleCompact(); assert.ok(Math.abs(win.getBounds().height - 122) <= 2, 'Native border may add two pixels');
       runtime.toggleCompact(); assert.equal(win.getBounds().height,height);
       runtime.hideOverlay();
     });
-    await test('capture protection excludes a visible overlay from native screen capture', async () => {
+    if (process.platform === 'win32') await test('capture protection excludes a visible overlay from native screen capture', async () => {
       assert.equal(win.isContentProtected(), true); assert.equal(runtime.currentState().captureProtectionActive, true);
       const display = screen.getPrimaryDisplay(), previous = win.getBounds();
       const bounds = { x: display.workArea.x + 50, y: display.workArea.y + 50, width: 460, height: Math.min(600,display.workArea.height-80) };
@@ -83,7 +89,24 @@ exports.run = async runtime => {
         await until(isGreen); await js('document.getElementById("closeSettings").click()');
       } finally { backdrop.destroy(); win.setBounds(previous); runtime.hideOverlay(); }
     });
-    await test('real Windows encryption protects saved keys and IPC state omits secrets', async () => {
+    if (process.platform === 'darwin') await test('Mac workspaces, shortcut labels, capture limitation and permission recovery', async () => {
+      assert.equal(win.isVisibleOnAllWorkspaces(), true);
+      assert.equal(win.isContentProtected(), true);
+      assert.equal(runtime.currentState().platform.trayName, 'menu bar');
+      assert.ok(runtime.currentState().shortcuts.every(item => item.display.startsWith('⌘+⌥+')));
+      await js('document.getElementById("settingsButton").click()');
+      assert.equal(await js('document.getElementById("screenPermission").hidden'), false);
+      assert.match(await js('document.getElementById("captureNote").textContent'), /ScreenCaptureKit can still record/);
+      await js('document.getElementById("closeSettings").click()');
+      try {
+        for (const permission of ['denied', 'restricted']) {
+          runtime.setScreenPermissionFunction(() => permission);
+          await assert.rejects(runtime.capture(), /System Settings/);
+          assert.equal(runtime.currentState().captureBusy, false);
+        }
+      } finally { runtime.setScreenPermissionFunction(() => systemPreferences.getMediaAccessStatus('screen')); }
+    });
+    await test('native encryption protects saved keys and IPC state omits secrets', async () => {
       assert.equal(runtime.store.available(),true);
       await runtime.saveSettings({provider:'anthropic',apiKey:key});
       const disk = fs.readFileSync(path.join(runtime.app.getPath('userData'),'credentials.enc'));
@@ -158,6 +181,78 @@ exports.run = async runtime => {
       runtime.cancel(); await until(()=>!runtime.currentState().busy);
       assert.equal(runtime.getHistory().length,4); assert.match(runtime.currentState().lastAttempt.error,/stopped/i);
     });
+    await test('normal Quit attempts and cancelled explicit Quit preserve the running answer', async () => {
+      assert.equal(runtime.currentState().settings.protectFromQuit, true);
+      runtime.showOverlay(false);
+      const visible = win.isVisible(), processId = process.pid;
+      let confirmations = 0;
+      runtime.setQuitConfirmationFunction(async () => { confirmations++; return false; });
+      await runtime.ask({ text: 'Keep this unfinished answer running during a normal Quit request' });
+      runtime.app.quit();
+      await delay(120);
+      assert.equal(runtime.currentState().busy, true, 'Blocked Quit must not cancel a running answer');
+      assert.equal(win.isVisible(), visible, 'Blocked Quit must not hide, show or refocus the window');
+      assert.equal(await js('window.overlay.quit().then(result => result.value)'), false);
+      assert.equal(confirmations, 1);
+      assert.equal(runtime.currentState().busy, true);
+      assert.equal(process.pid, processId);
+      assert.equal(runtime.getHistory().length, 4);
+      assert.equal(await js('window.overlay.state().then(result => result.ok)'), true);
+      runtime.cancel(); await until(() => !runtime.currentState().busy);
+      runtime.hideOverlay();
+    });
+    await test('automatic reopening can be paused during an answer and rearmed by an explicit app open', async () => {
+      const fake = {
+        available: true, enabled: true, busy: false,
+        status() { return { available: this.available, enabled: this.enabled, busy: false, error: '' }; },
+        async enable() { this.enabled = true; }, async disable() { this.enabled = false; }
+      };
+      const original = runtime.setRecoveryController(fake);
+      try {
+        await runtime.ask({ text: 'Keep answering while reopening is paused' });
+        await js('document.getElementById("settingsButton").click()');
+        assert.equal(await js('typeof window.overlay.setRecoveryEnabled'), 'function');
+        assert.equal(await js('document.getElementById("recoveryEnabled").checked'), true);
+        assert.equal(await js('document.getElementById("recoveryEnabled").disabled'), false);
+        await js('document.getElementById("recoveryEnabled").click()');
+        await until(() => !fake.enabled);
+        await until(async () => await js('document.getElementById("recoveryStatus").textContent.includes("paused")'));
+        assert.equal(runtime.currentState().busy, true, 'Pausing recovery must not stop an active answer');
+        assert.equal(runtime.store.read('preferences.json', {}).recoveryEnabled, undefined, 'Recovery is a session control');
+        await js('document.getElementById("closeSettings").click()');
+        runtime.app.emit('activate');
+        await until(() => fake.enabled);
+        const bad = await js('window.overlay.setRecoveryEnabled("yes")');
+        assert.equal(bad.ok, false);
+      } finally {
+        runtime.cancel(); await until(() => !runtime.currentState().busy);
+        runtime.setRecoveryController(original); runtime.hideOverlay();
+      }
+      assert.equal(runtime.currentState().recovery.available, false, 'Development must not register a production service');
+    });
+    if (process.platform === 'darwin') {
+      const helper = path.join(work, 'normal-quit-request');
+      if (fs.existsSync(helper)) await test('a separate native Mac process cannot close the protected app with normal terminate()', async () => {
+        runtime.hideOverlay();
+        const { stdout } = await runFile(helper, [String(process.pid)], { timeout: 5000 });
+        assert.match(stdout, /Normal native quit request sent/);
+        await delay(250);
+        assert.equal(win.isDestroyed(), false);
+        assert.equal(win.isVisible(), false, 'An external quit must not bring the hidden app to the foreground');
+        assert.equal(await js('window.overlay.state().then(result => result.ok)'), true);
+        assert.equal(runtime.getHistory().length, 4);
+      });
+      else skip('a separate native Mac process cannot close the protected app with normal terminate()', 'Native fixture needs Xcode Command Line Tools');
+    }
+    await test('close protection is visible in Settings and persists when toggled', async () => {
+      await js('document.getElementById("settingsButton").click()');
+      assert.equal(await js('document.getElementById("protectFromQuit").checked'), true);
+      await js('document.getElementById("closeSettings").click()');
+      await runtime.saveSettings({ protectFromQuit: false });
+      assert.equal(runtime.store.read('preferences.json', {}).protectFromQuit, false);
+      await runtime.saveSettings({ protectFromQuit: true });
+      assert.equal(runtime.store.read('preferences.json', {}).protectFromQuit, true);
+    });
     await test('main frame IPC rejects a different window', async () => {
       const stranger = new BrowserWindow({show:false,webPreferences:{preload:path.resolve(__dirname,'..','overlay','preload.js'),sandbox:true,contextIsolation:true,nodeIntegration:false}});
       await stranger.loadFile(path.resolve(__dirname,'..','overlay','ui','index.html'));
@@ -170,23 +265,144 @@ exports.run = async runtime => {
       assert.equal(runtime.getHistory().length,4); assert.equal(win.isAlwaysOnTop(),true); assert.equal(win.isContentProtected(),true);
       assert.equal(await js('document.getElementById("provider").value'),'anthropic');
     });
-    await test('native display capture returns a bounded JPEG preview', async () => {
+    if (runtime.currentState().screenPermission === 'granted') await test('native display capture returns a bounded JPEG preview', async () => {
       const displays=runtime.currentState().displays;
       const image=await runtime.capture(displays.find(display=>display.primary).id);
       assert.ok(image.width<=2560 && image.height<=2560); assert.ok(image.preview.startsWith('data:image/'));
       assert.equal(nativeImage.createFromDataURL(image.preview).isEmpty(),false);
     });
+    else skip('native display capture returns a bounded JPEG preview', 'Screen Recording permission has not been granted to this test app');
+    await test('all providers have model dropdowns, per-provider defaults, and a working custom model option', async () => {
+      const initial = runtime.currentState().settings;
+      for (const provider of ['openai','gemini','anthropic']) {
+        await runtime.saveSettings({ provider });
+        await until(async () => await js('document.getElementById("provider").value') === provider);
+        const options = await js('[...document.getElementById("quickModel").options].map(option=>option.value)');
+        assert.ok(options.length >= 4);
+        for (const model of runtime.currentState().modelCatalog[provider]) assert.ok(options.includes(model.id));
+        await js(`document.getElementById("quickModel").value=${JSON.stringify(options[1])};document.getElementById("quickModel").dispatchEvent(new Event("change"))`);
+        await until(() => runtime.currentState().settings.models[provider] === options[1]);
+        await runtime.saveSettings({ models: { [provider]: initial.models[provider] } });
+      }
+      await js('document.getElementById("settingsButton").click();document.getElementById("modelPreset").value="__custom__";document.getElementById("modelPreset").dispatchEvent(new Event("change"));document.getElementById("model").value="claude-custom-test";document.getElementById("settingsForm").dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}))');
+      await until(() => runtime.currentState().settings.models.anthropic === 'claude-custom-test');
+      await until(async () => await js('!document.getElementById("settingsDialog").open'));
+      assert.equal(await js('document.getElementById("quickModel").value'),'claude-custom-test');
+      await runtime.saveSettings({ provider:'anthropic', models: initial.models });
+      assert.equal(consoleErrors.length,0,consoleErrors.join('\n'));
+    });
+    await test('OpenAI key is encrypted and text plus image follow-ups route to the selected provider', async () => {
+      runtime.setKeyValidator(async () => true);
+      await runtime.saveSettings({provider:'openai',apiKey:'test-openai-not-a-real-api-key'});
+      assert.equal(runtime.currentState().keyStatus.openai,true);
+      assert.equal(JSON.stringify(runtime.currentState()).includes('test-openai-not-a-real-api-key'),false);
+      assert.equal(fs.readFileSync(path.join(runtime.app.getPath('userData'),'credentials.enc')).includes(Buffer.from('test-openai')),false);
+      runtime.setAnswerFunction(async options => {
+        assert.equal(options.provider,'openai'); assert.equal(options.model,'gpt-6.1-sol');
+        assert.ok(options.messages.at(-1).image); options.onDelta('OpenAI test answer');
+        return {text:'OpenAI test answer',truncated:false};
+      });
+      const image=runtime.importImage({name:'openai-vision.png',data:imageBytes.toString('base64')});
+      await runtime.ask({text:'OpenAI image test',imageId:image.id});
+      await until(()=>!runtime.currentState().busy);
+      await until(async()=>await js('document.querySelector(".message:last-child .message-header").textContent.includes("CHATGPT")'));
+      assert.equal(runtime.getHistory().at(-1).provider,'openai');
+      await runtime.saveSettings({provider:'anthropic'});
+    });
+    await test('file upload, drag and drop, copy, export and rejected files use the real renderer bridge', async () => {
+      const imageFile=path.join(work,'upload-fixture.png'); fs.writeFileSync(imageFile,imageBytes);
+      const originalOpen=dialog.showOpenDialog, originalSave=dialog.showSaveDialog;
+      try {
+        dialog.showOpenDialog=async()=>({canceled:false,filePaths:[imageFile]});
+        await js('document.getElementById("uploadButton").click()');
+        await until(async()=>await js('document.getElementById("imageName").textContent === "upload-fixture.png"'));
+        await js('document.getElementById("removeImage").click()');
+        assert.equal(await js('document.getElementById("attachment").hidden'),true);
+        await js(`(()=>{const bytes=Uint8Array.from(atob(${JSON.stringify(imageBytes.toString('base64'))}),c=>c.charCodeAt(0));const dt=new DataTransfer();dt.items.add(new File([bytes],'drop.png',{type:'image/png'}));document.dispatchEvent(new DragEvent('drop',{dataTransfer:dt,bubbles:true,cancelable:true}));})()`);
+        await until(async()=>await js('document.getElementById("imageName").textContent === "drop.png"'));
+        await js('document.getElementById("removeImage").click()');
+        const invalid=await js('window.overlay.importImage({name:"bad.png",data:btoa("not an image")})');
+        assert.equal(invalid.ok,false);
+        await js('document.querySelector(".message:last-child .message-actions button").click()');
+        await until(async()=>await clipboard.readText()==='OpenAI test answer');
+        await clipboard.write([new ClipboardItem({'image/png':new Blob([imageBytes],{type:'image/png'})})]);
+        assert.ok((await js('window.overlay.pasteImage()')).value.preview.startsWith('data:image/'));
+        const exportFile=path.join(work,'export-fixture.md');
+        dialog.showSaveDialog=async()=>({canceled:false,filePath:exportFile});
+        const exported=await js('window.overlay.export()'); assert.equal(exported.value,true);
+        assert.match(fs.readFileSync(exportFile,'utf8'),/OpenAI test answer/);
+        dialog.showOpenDialog=async()=>({canceled:true,filePaths:[]});
+        assert.equal((await js('window.overlay.upload()')).value,null);
+      } finally {dialog.showOpenDialog=originalOpen;dialog.showSaveDialog=originalSave;}
+    });
+    await test('New chat archives encrypted history, resets draft and context, and restores previous chats', async () => {
+      const original=runtime.getHistory().map(message=>message.text);
+      await js('document.getElementById("question").value="unsent draft";document.getElementById("question").dispatchEvent(new Event("input"));document.getElementById("newChatButton").click()');
+      await until(()=>runtime.getHistory().length===0);
+      await until(async()=>await js('document.getElementById("question").value === ""'));
+      assert.equal(runtime.currentState().archivedChats.length,1);
+      assert.equal(runtime.currentState().lastAttempt,null); assert.equal(runtime.images.size,0);
+      assert.equal(fs.readFileSync(path.join(runtime.app.getPath('userData'),'chats.enc')).includes(Buffer.from('OpenAI test answer')),false);
+      const id=runtime.currentState().archivedChats[0].id;
+      runtime.setAnswerFunction(async options=>{assert.equal(options.messages.length,1,'New chat must not send old context');options.onDelta('Fresh answer');return{text:'Fresh answer',truncated:false};});
+      await runtime.ask({text:'Fresh question'});await until(()=>!runtime.currentState().busy);
+      await js('document.getElementById("settingsButton").click()');
+      await js(`document.getElementById("chatSelect").value=${JSON.stringify(id)};document.getElementById("chatSelect").dispatchEvent(new Event("change"));document.getElementById("openChatButton").click()`);
+      await until(()=>runtime.getHistory().length===original.length);
+      assert.deepEqual(runtime.getHistory().map(message=>message.text),original);
+      const saved=runtime.store.read('chats.enc',null,true);assert.deepEqual(saved.current.map(message=>message.text),original);
+      assert.equal(saved.archive[0].history[0].text,'Fresh question');
+      const savedState=JSON.stringify(runtime.currentState());
+      const write=runtime.store.write.bind(runtime.store);runtime.store.write=()=>{throw new Error('simulated archive disk failure');};
+      try {assert.throws(()=>runtime.changeConversation(),/disk failure/);}
+      finally{runtime.store.write=write;}
+      assert.equal(JSON.stringify(runtime.currentState()),savedState,'A failed New chat must preserve the conversation');
+      await js('document.getElementById("settingsButton").click()');
+      const archived=runtime.currentState().archivedChats[0].id;
+      await js(`document.getElementById("chatSelect").value=${JSON.stringify(archived)};document.getElementById("chatSelect").dispatchEvent(new Event("change"));document.getElementById("deleteChatButton").click();document.getElementById("cancelDeleteChat").click()`);
+      assert.equal(runtime.currentState().archivedChats.length,1);
+      await js('document.getElementById("deleteChatButton").click();document.getElementById("confirmDeleteChat").click()');
+      await until(()=>runtime.currentState().archivedChats.length===0);
+      await js('document.getElementById("closeSettings").click()');
+    });
+    await test('New chat rejects active answers; retry, cancel, clear and history opt-out behave consistently', async () => {
+      let calls=0;
+      runtime.setAnswerFunction(async({onDelta})=>{calls++;if(calls===1)throw new Error('Temporary test failure');onDelta('Retried answer');return{text:'Retried answer',truncated:false};});
+      await runtime.ask({text:'Retry me'});await until(()=>!runtime.currentState().busy);
+      await until(async()=>await js('!!document.querySelector(".retry-button")'));
+      await js('document.querySelector(".retry-button").click()');await until(()=>!runtime.currentState().busy&&calls===2);
+      runtime.setAnswerFunction(async({signal})=>new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(new Error('cancelled')),{once:true})));
+      await runtime.ask({text:'Hold answer'});
+      assert.throws(()=>runtime.changeConversation(),/Stop the current answer/);
+      assert.equal(await js('document.getElementById("newChatButton").disabled'),true);
+      await js('document.getElementById("stopButton").click()');await until(()=>!runtime.currentState().busy);
+      await runtime.saveSettings({opacity:0.67});assert.ok(Math.abs(win.getOpacity()-0.67)<0.01);
+      await runtime.saveSettings({opacity:0.98,rememberHistory:false});
+      assert.equal(fs.existsSync(path.join(runtime.app.getPath('userData'),'chats.enc')),false);
+      assert.equal(fs.existsSync(path.join(runtime.app.getPath('userData'),'conversation.enc')),false);
+      await runtime.saveSettings({rememberHistory:true});
+      await js('document.getElementById("settingsButton").click();document.getElementById("clearButton").click();document.getElementById("cancelClear").click()');
+      assert.ok(runtime.getHistory().length>0);
+      await js('document.getElementById("clearButton").click();document.getElementById("confirmClear").click()');
+      await until(()=>runtime.getHistory().length===0);
+      assert.equal(runtime.store.read('chats.enc',null,true).current.length,0);
+      assert.ok(runtime.currentState().shortcuts.every(shortcut=>globalShortcut.isRegistered(shortcut.accelerator)));
+    });
     await test('deleting a key takes effect and image cache is bounded', async () => {
+      runtime.setAnswerFunction(async({onDelta})=>{onDelta('Persisted test answer');return{text:'Persisted test answer',truncated:false};});
+      await runtime.ask({text:'Archived chat after restart'});await until(()=>!runtime.currentState().busy);
+      runtime.changeConversation();
+      await runtime.ask({text:'Current chat after restart'});await until(()=>!runtime.currentState().busy);
       for(let i=0;i<13;i++) runtime.importImage({name:`image${i}.png`,data:imageBytes.toString('base64')});
       assert.ok(runtime.images.size<=10);
       await runtime.saveSettings({provider:'anthropic',removeKey:true}); assert.equal(runtime.currentState().keyStatus.anthropic,false);
       await assert.rejects(runtime.ask({text:'hello'}),/API key/);
     });
-    console.log(`Desktop tests passed: ${results.length}`);
+    console.log(`Desktop tests passed: ${results.filter(result => result.passed).length}; skipped: ${results.filter(result => result.skipped).length}`);
   } catch (error) { if (!results.some(result=>!result.passed)) results.push({name:'desktop suite setup or completion',passed:false,error:error.message}); console.error(error.stack); }
   finally {
     clearTimeout(watchdog);
     fs.writeFileSync(path.join(work,'desktop-test-results.json'),JSON.stringify({results,consoleErrors,profile:runtime.app.getPath('userData')},null,2));
-    runtime.app.exit(results.some(result=>!result.passed)?1:0);
+    runtime.app.exit(results.some(result=>!result.passed && !result.skipped)?1:0);
   }
 };

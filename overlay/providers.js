@@ -15,6 +15,9 @@ async function validateApiKey(provider, apiKey, { fetchImpl = fetch, timeoutMs =
   } : provider === 'gemini' ? {
     url: 'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1',
     headers: { 'x-goog-api-key': apiKey }
+  } : provider === 'openai' ? {
+    url: 'https://api.openai.com/v1/models',
+    headers: { Authorization: `Bearer ${apiKey}` }
   } : null;
   if (!request) throw new ProviderError('Unknown AI provider.');
   const controller = new AbortController();
@@ -36,6 +39,19 @@ async function validateApiKey(provider, apiKey, { fetchImpl = fetch, timeoutMs =
 }
 
 function buildRequest(provider, model, apiKey, messages) {
+  if (provider === 'openai') {
+    return {
+      url: 'https://api.openai.com/v1/responses',
+      headers: { 'content-type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: {
+        model, instructions: SYSTEM, stream: true, store: false, max_output_tokens: 8192,
+        input: messages.map(message => ({ role: message.role, content: [
+          ...(message.image && message.role === 'user' ? [{ type: 'input_image', image_url: `data:${message.image.mime};base64,${message.image.data}` }] : []),
+          { type: message.role === 'assistant' ? 'output_text' : 'input_text', text: message.text }
+        ] }))
+      }
+    };
+  }
   if (provider === 'anthropic') {
     return {
       url: 'https://api.anthropic.com/v1/messages',
@@ -105,7 +121,7 @@ async function streamAnswer({ provider, model, apiKey, messages, signal, onDelta
     for (let attempt = 0; attempt < 3; attempt++) {
       combined.throwIfAborted();
       try {
-        const response = await fetchImpl(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify(request.body), signal: combined });
+        const response = await fetchImpl(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify(request.body), signal: combined, redirect: 'error' });
         if (!response.ok) {
           await response.body?.cancel();
           throw httpError(response.status);
@@ -119,6 +135,16 @@ async function streamAnswer({ provider, model, apiKey, messages, signal, onDelta
             if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') delta = event.delta.text || '';
             if (event.type === 'message_delta') stopReason = event.delta?.stop_reason || stopReason;
             if (event.type === 'message_stop') completed = true;
+          } else if (provider === 'openai') {
+            if (event.type === 'error' || event.type === 'response.failed') throw new ProviderError('OpenAI interrupted the answer. Check the model and account access, then retry.');
+            if (event.type === 'response.output_text.delta') delta = typeof event.delta === 'string' ? event.delta : '';
+            if (event.type === 'response.refusal.delta') throw new ProviderError('The provider declined this question. Try rephrasing it.');
+            if (event.type === 'response.completed') { completed = true; stopReason = 'completed'; }
+            if (event.type === 'response.incomplete') {
+              const reason = event.response?.incomplete_details?.reason;
+              if (reason !== 'max_output_tokens') throw new ProviderError('OpenAI could not complete this answer. Try rephrasing the question.');
+              completed = true; stopReason = 'max_tokens';
+            }
           } else {
             if (event.error) throw new ProviderError('The provider interrupted the answer. Please retry.');
             const candidate = event.candidates?.[0];

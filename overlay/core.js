@@ -2,21 +2,22 @@
 
 const MAX_TEXT = 12000;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const { PROVIDERS } = require('./models');
 const DEFAULTS = Object.freeze({
   provider: 'anthropic',
-  models: { anthropic: 'claude-sonnet-5-5', gemini: 'gemini-3.8-flash' },
-  opacity: 0.98, launchAtLogin: false, rememberHistory: true, hideFromCapture: true,
+  models: { anthropic: 'claude-sonnet-5-5', gemini: 'gemini-3.8-flash', openai: 'gpt-6.1-sol' },
+  opacity: 0.98, launchAtLogin: false, rememberHistory: true, hideFromCapture: true, protectFromQuit: true,
   bounds: null, compact: false
 });
 
 function validateSettings(input, current = DEFAULTS) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid settings.');
-  const next = { ...current, models: { ...current.models } };
+  const next = { ...DEFAULTS, ...current, models: { ...DEFAULTS.models, ...current.models } };
   if ('provider' in input) {
-    if (!['anthropic', 'gemini'].includes(input.provider)) throw new Error('Choose Claude or Gemini.');
+    if (!PROVIDERS.includes(input.provider)) throw new Error('Choose Claude, Gemini, or OpenAI / ChatGPT.');
     next.provider = input.provider;
   }
-  for (const provider of ['anthropic', 'gemini']) {
+  for (const provider of PROVIDERS) {
     if (input.models && provider in input.models) {
       const model = input.models[provider];
       if (typeof model !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,99}$/.test(model)) throw new Error('Enter a valid model ID.');
@@ -27,7 +28,7 @@ function validateSettings(input, current = DEFAULTS) {
     if (!Number.isFinite(input.opacity) || input.opacity < 0.65 || input.opacity > 1) throw new Error('Opacity must be between 65% and 100%.');
     next.opacity = input.opacity;
   }
-  for (const key of ['launchAtLogin', 'rememberHistory', 'compact', 'hideFromCapture']) {
+  for (const key of ['launchAtLogin', 'rememberHistory', 'compact', 'hideFromCapture', 'protectFromQuit']) {
     if (key in input) {
       if (typeof input[key] !== 'boolean') throw new Error('Invalid preference.');
       next[key] = input[key];

@@ -4,6 +4,9 @@ const invoke = (channel, ...args) => ipcRenderer.invoke(`overlay:${channel}`, ..
 contextBridge.exposeInMainWorld('overlay', {
   state: () => invoke('state'),
   ask: question => invoke('ask', question),
+  newChat: () => invoke('new-chat'),
+  openChat: id => invoke('open-chat', id),
+  deleteChat: id => invoke('delete-chat', id),
   cancel: () => invoke('cancel'),
   upload: () => invoke('upload'),
   pasteImage: () => invoke('paste-image'),
@@ -11,6 +14,8 @@ contextBridge.exposeInMainWorld('overlay', {
   capture: displayId => invoke('capture', displayId),
   releaseImage: id => invoke('release-image', id),
   saveSettings: settings => invoke('save-settings', settings),
+  setRecoveryEnabled: enabled => invoke('set-recovery-enabled', enabled),
+  openScreenSettings: () => invoke('screen-settings'),
   clear: () => invoke('clear'),
   export: () => invoke('export'),
   hide: () => invoke('hide'),

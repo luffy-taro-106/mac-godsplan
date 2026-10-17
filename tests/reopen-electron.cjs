@@ -12,14 +12,18 @@ assert.equal(path.dirname(profile),path.resolve(os.tmpdir()));
 assert.ok(path.basename(profile).startsWith('opencluely-test-'));
 app.setName('OpenCluely Overlay');
 app.setPath('userData',profile);
-app.setAppUserModelId('com.opencluely.overlay');
+if (process.platform === 'win32') app.setAppUserModelId('com.opencluely.overlay');
 app.whenReady().then(()=>{
   const result={name:'verified replacement key restores in a new Electron process',passed:false};
   try {
     const store=new Store(profile,safeStorage);
-    assert.deepEqual(store.read('credentials.enc',{},true),{gemini:'replacement-gemini-test-key'});
+    assert.deepEqual(store.read('credentials.enc',{},true),{gemini:'replacement-gemini-test-key',openai:'test-openai-not-a-real-api-key'});
     assert.equal(store.read('preferences.json',{}).hideFromCapture,true);
-    assert.equal(store.read('conversation.enc',[],true).length,4);
+    assert.equal(store.read('conversation.enc',[],true)[0].text,'Current chat after restart');
+    const chats=store.read('chats.enc',null,true);
+    assert.equal(chats.current[0].text,'Current chat after restart');
+    assert.equal(chats.archive[0].history[0].text,'Archived chat after restart');
+    assert.equal(store.read('preferences.json',{}).models.openai,'gpt-6.1-sol');
     result.passed=true; console.log(`PASS ${result.name}`);
   } catch { result.error='Saved test profile did not restore after process restart'; console.error(`FAIL ${result.name}`); }
   report.results.push(result); fs.writeFileSync(resultsFile,JSON.stringify(report,null,2)); app.exit(result.passed?0:1);

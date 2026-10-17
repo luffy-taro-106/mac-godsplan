@@ -14,7 +14,7 @@ class Store {
     const file = path.join(this.directory, name);
     if (!fs.existsSync(file)) return fallback;
     try {
-      if (fs.statSync(file).size > 4 * 1024 * 1024) throw new Error('Oversized settings file');
+      if (fs.statSync(file).size > (name === 'chats.enc' ? 8 : 4) * 1024 * 1024) throw new Error('Oversized settings file');
       const data = fs.readFileSync(file);
       return JSON.parse(encrypted ? this.crypto.decryptString(data) : data.toString('utf8'));
     } catch {

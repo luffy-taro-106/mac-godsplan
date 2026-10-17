@@ -1,13 +1,13 @@
 {
   "name": "opencluely-overlay",
-  "version": "2.1.0",
-  "description": "Persistent desktop overlay for text and image questions with Claude and Gemini",
+  "version": "2.3.0",
+  "description": "Persistent desktop overlay for text and image questions with OpenAI, Claude and Gemini",
   "main": "overlay/main.js",
   "author": "OpenCluely contributors",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ashokchilka99/opencluely-overlay.git"
+    "url": "https://github.com/ashokchilka99/mac-godsplan.git"
   },
   "engines": {
     "node": ">=22"
@@ -15,13 +15,17 @@
   "scripts": {
     "start": "node scripts/launch.js",
     "dev": "node scripts/launch.js",
-    "test": "node --test tests/core.test.js tests/providers.test.js tests/storage.test.js",
+    "test": "node --test tests/core.test.js tests/providers.test.js tests/storage.test.js tests/platform.test.js tests/quit-guard.test.js tests/recovery.test.js",
     "test:desktop": "node scripts/launch.js --smoke-test",
+    "test:recovery": "node --test --test-concurrency=1 tests/recovery-native.test.js tests/recovery-launchd.test.js",
     "icons": "node scripts/create-icons.js",
     "postinstall": "node scripts/create-icons.js",
-    "build": "electron-builder",
+    "build": "node scripts/build-recovery.js && electron-builder",
     "build:win": "electron-builder --win nsis portable --x64",
-    "pack": "electron-builder --dir"
+    "build:mac": "node scripts/build-recovery.js arm64 && electron-builder --mac dmg zip --arm64",
+    "build:mac:all": "node scripts/build-recovery.js --all && electron-builder --mac dmg zip --arm64 --x64",
+    "pack:mac": "node scripts/build-recovery.js arm64 && electron-builder --mac --dir --arm64",
+    "pack": "node scripts/build-recovery.js && electron-builder --dir"
   },
   "dependencies": {
     "dompurify": "3.4.17",
@@ -48,6 +52,25 @@
       "!**/*.map"
     ],
     "asar": true,
+    "asarUnpack": ["overlay/native/bin/**"],
+    "mac": {
+      "icon": "overlay/assets/icon.icns",
+      "identity": "-",
+      "category": "public.app-category.productivity",
+      "target": ["dmg", "zip"],
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "LSUIElement": true,
+        "NSScreenCaptureUsageDescription": "OpenCluely takes a screenshot only when you press Screenshot. You preview it before sending it to your AI provider."
+      },
+      "artifactName": "OpenCluely-Overlay-${version}-mac-${arch}.${ext}"
+    },
+    "dmg": {
+      "title": "OpenCluely Overlay",
+      "contents": [{"x": 130, "y": 220}, {"x": 410, "y": 220, "type": "link", "path": "/Applications"}]
+    },
     "win": {
       "icon": "overlay/assets/icon.ico",
       "target": [

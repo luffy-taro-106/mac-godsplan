@@ -1,12 +1,22 @@
-# OpenCluely Overlay 2.1
+# OpenCluely Overlay 2.3
 
-Windows desktop assistant for text and image questions using Claude or Gemini.
+**Mac God'sPlan** (`mac-godsplan`) is the macOS adaptation of [ashokchilka99/opencluely-overlay](https://github.com/ashokchilka99/opencluely-overlay). The source, tests, native recovery helper, build configuration and setup documentation are included here.
+
+macOS and Windows desktop assistant for text and image questions using OpenAI / ChatGPT, Claude, or Gemini.
+
+**Mac:** Open `dist/mac-arm64/OpenCluely Overlay.app`, or install the DMG from `dist/`. See [Mac setup and feature notes](docs/MACOS.md). The original interface and text/image features are preserved, with native menu-bar controls, Command+Option shortcuts, Keychain encryption, and screenshot permission guidance. Screen-sharing exclusion is best effort on macOS; modern ScreenCaptureKit clients can still capture the overlay.
+
+Version 2.2.0 adds **automatic reopening** on Mac, enabled whenever the installed app opens. Pause it immediately from Settings or the menu bar; a deliberate Quit stops both the app and recovery. The next app opening enables it again. See [automatic reopening and owner controls](docs/AUTOMATIC-REOPENING.md).
+
+Version 2.3.0 adds **OpenAI / ChatGPT API support**, provider-specific model dropdowns with a custom-ID option, and **New chat**. With restoration enabled, previous conversations are encrypted and can be reopened from Settings. See the [end-to-end verification](docs/E2E-VERIFICATION.md) and [upstream comparison](docs/COMPARISON.md).
+
+**Protect against normal Quit requests** remains enabled by default. External cooperative Quit requests are declined; quitting through OpenCluely asks for confirmation. Force termination can still interrupt the app; automatic reopening provides recovery afterward. See [close-protection details and checks](docs/CLOSE-PROTECTION.md).
 
 - Always-on-top overlay with tray controls, click-through, and global shortcuts.
 - Text questions, image upload/paste/drop, screenshots, and streamed answers.
-- Separate Claude and Gemini keys, verified before saving with Windows encryption.
+- Separate OpenAI, Claude, and Gemini keys, verified before saving with Keychain-backed encryption on Mac or Windows encryption.
 - Screen-capture protection enabled by default; check your meeting client's preview.
-- Optional startup after Windows sign-in and encrypted conversation restoration.
+- Optional startup after sign-in and encrypted conversation restoration.
 
 Download the Windows installer from [Releases](https://github.com/ashokchilka99/opencluely-overlay/releases/latest). It is an unsigned development build.
 
@@ -24,6 +34,8 @@ npm run test:desktop
 npm run build:win
 ```
 
-Desktop checks require an interactive Windows session. Test outputs stay in the ignored `.test-output/` directory. API keys, local conversations, dependencies, and generated builds are excluded from Git.
+Desktop checks require an interactive desktop session. Test outputs stay in the ignored `.test-output/` directory. API keys, local conversations, dependencies, and generated builds are excluded from Git.
+
+On macOS, use `npm run build:mac` for Apple Silicon, `npm run build:mac:all` for Apple Silicon and Intel, or `npm run pack:mac` for an app bundle. Desktop checks also run on Mac, with screenshot capture checked only when Screen Recording permission is already granted. Unit tests never need provider keys.
 
 Based on [arth-agrawal/OpenCluely](https://github.com/arth-agrawal/OpenCluely) and [TechyCSR/OpenCluely](https://github.com/TechyCSR/OpenCluely). The original implementation remains available in Git history. Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).

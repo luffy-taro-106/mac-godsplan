@@ -1,5 +1,7 @@
 # Windows startup and shortcuts
 
+For macOS startup, menu-bar controls, and shortcuts, see [Mac setup](MACOS.md). This page records the original Windows behavior and verification.
+
 Install the Windows setup executable from Releases, open Settings, and enable **Start in tray when I sign in**. The app registers `com.opencluely.overlay` under the current user's Windows startup entries, pointing to the installed executable with `--background`.
 
 The default executable location is `%LOCALAPPDATA%\Programs\OpenCluely Overlay\OpenCluely Overlay.exe`. Source and portable builds disable startup registration because their paths may be temporary.

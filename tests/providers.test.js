@@ -8,13 +8,13 @@ function response(text, chunkSize = 7) { return new Response(new ReadableStream(
 const anthropicStream = text => frame({ type:'content_block_delta',delta:{type:'text_delta',text} }) + frame({type:'message_delta',delta:{stop_reason:'end_turn'}}) + frame({type:'message_stop'});
 const options = { provider:'anthropic', model:'claude-sonnet-5-5', apiKey:'test-key-not-real', messages:[{role:'user',text:'test'}], retryDelayMs:1 };
 
-test('key verification authenticates both providers without generation or URL secrets', async () => {
-  for (const provider of ['gemini','anthropic']) {
+test('key verification authenticates all providers without generation or URL secrets', async () => {
+  for (const provider of ['gemini','anthropic','openai']) {
     let canceled = false;
     const result = await validateApiKey(provider, 'private-test-key', { fetchImpl: async (url, input) => {
-      assert.match(url, /\/models\?/); assert.ok(!url.includes('private-test-key'));
+      assert.match(url, /\/models(?:\?|$)/); assert.ok(!url.includes('private-test-key'));
       assert.equal(input.method, 'GET'); assert.equal(input.body, undefined); assert.equal(input.redirect, 'error');
-      assert.equal(input.headers[provider === 'gemini' ? 'x-goog-api-key' : 'x-api-key'], 'private-test-key');
+      assert.equal(input.headers[provider === 'openai' ? 'Authorization' : provider === 'gemini' ? 'x-goog-api-key' : 'x-api-key'], provider === 'openai' ? 'Bearer private-test-key' : 'private-test-key');
       return { status: 200, body: { cancel: async () => { canceled = true; } } };
     } });
     assert.equal(result, true); assert.equal(canceled, true);
@@ -36,6 +36,24 @@ test('provider adapters keep keys in headers and send images in native formats',
   assert.equal(claude.body.messages[0].content[0].source.media_type,'image/jpeg'); assert.equal(claude.headers['x-api-key'],'secret'); assert.ok(!claude.url.includes('secret'));
   const gemini = buildRequest('gemini','gemini-test','secret',messages);
   assert.equal(gemini.body.contents[1].role,'model'); assert.equal(gemini.body.contents[0].parts[0].inlineData.data,'pixels'); assert.ok(!gemini.url.includes('secret'));
+  const openai = buildRequest('openai','gpt-6.1-sol','secret',messages);
+  assert.equal(openai.url,'https://api.openai.com/v1/responses');
+  assert.equal(openai.headers.Authorization,'Bearer secret');
+  assert.equal(openai.body.store,false);
+  assert.equal(openai.body.input[0].content[0].image_url,'data:image/jpeg;base64,pixels');
+  assert.equal(openai.body.input[0].content[1].type,'input_text');
+  assert.equal(openai.body.input[1].content[0].type,'output_text');
+});
+test('OpenAI Responses streams text, ignores reasoning, and requires terminal events', async () => {
+  const run = text => streamAnswer({...options,provider:'openai',model:'gpt-6.1-sol',fetchImpl:async()=>response(text,1)});
+  const delta = frame({type:'response.output_text.delta',delta:'Hello 🌿'});
+  const complete = frame({type:'response.completed',response:{status:'completed'}});
+  assert.deepEqual(await run(frame({type:'response.reasoning_summary_text.delta',delta:'private'})+delta+complete),{text:'Hello 🌿',truncated:false});
+  await assert.rejects(run(delta),/before the answer completed/);
+  assert.deepEqual(await run(delta+frame({type:'response.incomplete',response:{incomplete_details:{reason:'max_output_tokens'}}})),{text:'Hello 🌿',truncated:true});
+  for (const failure of [{type:'response.failed'},{type:'error',message:'secret'},{type:'response.refusal.delta',delta:'secret'},{type:'response.incomplete',response:{incomplete_details:{reason:'content_filter'}}}]) {
+    await assert.rejects(run(frame(failure)),error=>!error.message.includes('secret'));
+  }
 });
 test('SSE handles fragmented CRLF, unicode and comments', async () => {
   const text = ': ping\r\n\r\n' + frame({text:'हेलो 🌿'});

@@ -2,11 +2,13 @@
 const $ = id => document.getElementById(id);
 const api = window.overlay;
 let state, attachment = null, sending = false, importing = false, streamTimer, toastTimer, streamView, renderedSignature = '', autoScroll = true, dragDepth = 0;
-const models = { anthropic: 'claude-sonnet-5-5', gemini: 'gemini-3.8-flash' };
+const models = {};
+let deletingChatId = null;
 const question = $('question');
 const messageContainer = $('messages');
 const content = $('content');
 let selectedDisplay = sessionStorage.getItem('display') || '';
+let recoveryRequested = null, recoveryActionError = '';
 
 async function call(method, ...args) {
   const result = await api[method](...args);
@@ -39,7 +41,7 @@ function createMessage(role, text, metadata = {}) {
   const card = document.createElement('article'); card.className = `message ${role}`;
   const header = document.createElement('div'); header.className = 'message-header';
   if (role === 'assistant') header.append(icon('spark'));
-  const label = document.createElement('span'); label.textContent = role === 'user' ? 'YOU' : metadata.provider === 'gemini' ? 'GEMINI' : 'CLAUDE'; header.append(label);
+  const label = document.createElement('span'); label.textContent = role === 'user' ? 'YOU' : metadata.provider === 'openai' ? 'CHATGPT' : metadata.provider === 'gemini' ? 'GEMINI' : 'CLAUDE'; header.append(label);
   if (role === 'assistant' && metadata.model) { const model = document.createElement('span'); model.className = 'model-label'; model.textContent = metadata.model; header.append(model); }
   card.append(header);
   if (metadata.imageName || metadata.image?.name) {
@@ -88,22 +90,61 @@ function updateControls() {
   const busy = sending || !!state?.busy;
   $('sendButton').disabled = busy || importing || !(question.value.trim() || attachment);
   $('provider').disabled = busy;
+  $('quickModel').disabled = busy;
+  $('newChatButton').disabled = busy || importing || !!state?.captureBusy;
+  $('newChatButton').title = busy ? 'Stop the answer before starting a new chat' : 'Save this conversation and start a new one';
+  $('openChatButton').disabled = busy || !$('chatSelect').value;
+  $('deleteChatButton').disabled = !$('chatSelect').value;
   $('captureButton').disabled = !!state?.captureBusy || importing;
   $('uploadButton').disabled = importing;
   $('requestStatus').hidden = !busy;
-  $('footerStatus').textContent = busy ? 'Answering your question' : state?.passThrough ? 'Click-through enabled' : 'Runs in your tray';
+  $('footerStatus').textContent = busy ? 'Answering your question' : state?.passThrough ? 'Click-through enabled' : `Runs in your ${state?.platform.trayName || 'tray'}`;
+}
+function renderRecovery() {
+  const recovery = state?.recovery;
+  $('recoveryControl').hidden = !state?.platform.mac;
+  $('recoveryEnabled').checked = !!recovery?.enabled;
+  $('recoveryEnabled').disabled = !recovery?.available || !!recovery.busy || recoveryRequested !== null;
+  $('recoveryStatus').textContent = recoveryRequested !== null
+    ? recoveryRequested ? 'Starting automatic reopening…' : 'Pausing automatic reopening…'
+    : recovery?.busy ? 'Updating automatic reopening…'
+      : !recovery?.available ? 'Available in the installed macOS app.'
+        : recovery.enabled ? 'Automatic reopening is on.' : 'Automatic reopening is paused until the next launch.';
+  const error = recoveryActionError || recovery?.error || '';
+  $('recoveryError').textContent = error;
+  $('recoveryError').hidden = !error;
 }
 function applyState(value) {
   state = value;
+  recoveryActionError = '';
+  for (const shortcut of state.shortcuts) {
+    document.querySelectorAll('[data-shortcut]').forEach(element => { if (element.dataset.shortcut === shortcut.label) element.textContent = shortcut.display; });
+  }
+  const shortcut = label => state.shortcuts.find(item => item.label === label)?.display || '';
+  $('hideButton').title = `Hide to ${state.platform.trayName} · ${shortcut('Show / hide')}`;
+  $('hideButton').setAttribute('aria-label', `Hide to ${state.platform.trayName}`);
+  $('captureButton').title = `Capture selected display · ${shortcut('Screenshot')}`;
+  $('passButton').title = `Click-through · ${shortcut('Click-through')}`;
+  $('captureNote').textContent = state.platform.captureNote;
+  $('hideFromCapture').nextElementSibling.textContent = state.platform.mac ? 'Request capture protection (best effort)' : 'Hide overlay from screen sharing and recordings';
+  $('screenPermission').hidden = !state.platform.mac;
+  $('screenPermissionText').textContent = state.screenPermission === 'granted'
+    ? 'Screen Recording permission is enabled. Screenshots are previewed before sending.'
+    : 'To take screenshots, allow OpenCluely in Privacy & Security → Screen & System Audio Recording, then quit and reopen the app. Uploading and pasting images work without this permission.';
   Object.assign(models, state.settings.models);
   document.body.classList.toggle('compact', state.settings.compact);
   document.body.classList.toggle('pass-through', state.passThrough);
   $('passBanner').hidden = !state.passThrough;
   $('passButton').setAttribute('aria-pressed', String(state.passThrough));
   $('provider').value = state.settings.provider;
+  fillModelOptions($('quickModel'), state.settings.provider, models[state.settings.provider]);
+  const selectedChat = $('chatSelect').value;
+  $('chatSelect').replaceChildren(new Option('Choose a previous chat…', ''));
+  for (const chat of state.archivedChats || []) $('chatSelect').append(new Option(chat.title, chat.id));
+  if ((state.archivedChats || []).some(chat => chat.id === selectedChat)) $('chatSelect').value = selectedChat;
   $('setupNote').hidden = state.keyStatus[state.settings.provider];
   $('settingsWarnings').textContent = state.warnings.join('\n'); $('settingsWarnings').hidden = !state.warnings.length;
-  renderTimeline(); updateControls();
+  renderTimeline(); updateControls(); renderRecovery();
 }
 function setAttachment(image) {
   if (attachment && attachment.id !== image?.id) void call('releaseImage', attachment.id).catch(() => {});
@@ -132,10 +173,31 @@ async function submit(input = { text: question.value, imageId: attachment?.id })
 function resizeQuestion() { question.style.height = 'auto'; question.style.height = `${Math.min(140, Math.max(40, question.scrollHeight))}px`; }
 function populateKeyFields() {
   const provider = $('settingsProvider').value;
+  fillModelOptions($('modelPreset'), provider, models[provider], true);
   $('model').value = models[provider]; $('apiKey').value = '';
+  updateCustomModel();
+  $('openaiNote').hidden = provider !== 'openai';
   $('apiKey').placeholder = state?.keyStatus[provider] ? 'Leave blank to keep your saved key' : 'Paste your API key';
   $('keyBadge').textContent = state?.keyStatus[provider] ? 'Key saved' : 'No key yet';
   $('removeKey').hidden = !state?.keyStatus[provider];
+}
+function fillModelOptions(select, provider, current, settingsMenu = false) {
+  const options = (state?.modelCatalog?.[provider] || []).map(model => new Option(model.name, model.id));
+  const known = options.some(option => option.value === current);
+  if (current && !known && !settingsMenu) options.unshift(new Option(`${current} · custom`, current));
+  if (settingsMenu) options.push(new Option('Custom model ID…', '__custom__'));
+  select.replaceChildren(...options);
+  select.value = settingsMenu && !known ? '__custom__' : current;
+}
+function updateCustomModel() {
+  const custom = $('modelPreset').value === '__custom__';
+  $('customModelLabel').hidden = !custom;
+  $('model').required = custom;
+  if (!custom) $('model').value = $('modelPreset').value;
+}
+function resetComposer() {
+  question.value = ''; sessionStorage.removeItem('draft'); setAttachment(null); resizeQuestion();
+  autoScroll = true; $('settingsDialog').close(); question.focus();
 }
 function openSettings() {
   if (!state) return;
@@ -143,14 +205,17 @@ function openSettings() {
   $('settingsProvider').value = state.settings.provider; populateKeyFields();
   $('opacity').value = Math.round(state.settings.opacity * 100); $('opacityValue').textContent = `${$('opacity').value}%`;
   $('launchAtLogin').checked = state.settings.launchAtLogin; $('rememberHistory').checked = state.settings.rememberHistory;
+  $('protectFromQuit').checked = state.settings.protectFromQuit;
   $('hideFromCapture').checked = state.settings.hideFromCapture;
   $('launchAtLogin').disabled = !state.startupAvailable;
-  $('launchAtLogin').parentElement.title = state.startupAvailable ? '' : 'Install the Windows setup to enable launch at sign-in.';
+  $('launchAtLogin').parentElement.title = state.startupAvailable ? '' : state.platform.startupHint;
+  $('launchAtLogin').nextElementSibling.textContent = `Start in ${state.platform.trayName} when I sign in`;
   $('displaySelect').replaceChildren(new Option('Display under the pointer', ''));
   for (const display of state.displays) $('displaySelect').append(new Option(`${display.name}${display.primary ? ' (primary)' : ''}`, display.id));
   if (selectedDisplay && !state.displays.some(display => display.id === selectedDisplay)) selectedDisplay = '';
   $('displaySelect').value = selectedDisplay;
   $('settingsError').hidden = true;
+  if (state.startupStatus === 'requires-approval') { $('settingsError').textContent = 'Approve OpenCluely in System Settings → General → Login Items to finish enabling startup.'; $('settingsError').hidden = false; }
   if (!$('settingsDialog').open) $('settingsDialog').showModal();
 }
 
@@ -190,11 +255,38 @@ $('compactButton').addEventListener('click', guard(() => call('compact')));
 $('passButton').addEventListener('click', guard(() => call('passThrough')));
 $('stopButton').addEventListener('click', guard(async () => { await call('cancel'); $('statusText').textContent = 'Stopping…'; }));
 $('provider').addEventListener('change', guard(async () => { try { applyState(await call('saveSettings', { provider: $('provider').value })); } finally { $('provider').value = state.settings.provider; } }));
+$('quickModel').addEventListener('change', guard(async () => {
+  try { applyState(await call('saveSettings', { models: { [state.settings.provider]: $('quickModel').value } })); }
+  finally { fillModelOptions($('quickModel'), state.settings.provider, models[state.settings.provider]); }
+}));
+$('newChatButton').addEventListener('click', guard(async () => { applyState(await call('newChat')); resetComposer(); notify('New chat started. Previous conversation is in Settings → Previous chats.'); }));
+$('chatSelect').addEventListener('change', updateControls);
+$('openChatButton').addEventListener('click', guard(async () => { applyState(await call('openChat', $('chatSelect').value)); resetComposer(); }));
+$('deleteChatButton').addEventListener('click', () => {
+  deletingChatId = $('chatSelect').value;
+  $('deleteChatTitle').textContent = (state.archivedChats || []).find(chat => chat.id === deletingChatId)?.title || '';
+  $('deleteChatDialog').showModal();
+});
+$('cancelDeleteChat').addEventListener('click', () => { deletingChatId = null; $('deleteChatDialog').close(); });
+$('confirmDeleteChat').addEventListener('click', guard(async () => { applyState(await call('deleteChat', deletingChatId)); deletingChatId = null; $('deleteChatDialog').close(); notify('Saved chat deleted.'); }));
 $('settingsButton').addEventListener('click', openSettings); $('setupButton').addEventListener('click', openSettings);
+$('screenSettingsButton').addEventListener('click', guard(() => call('openScreenSettings')));
 $('closeSettings').addEventListener('click', () => { $('apiKey').value = ''; $('settingsDialog').close(); });
 $('settingsDialog').addEventListener('close', () => { $('apiKey').value = ''; });
 $('settingsProvider').addEventListener('change', populateKeyFields);
+$('modelPreset').addEventListener('change', updateCustomModel);
 $('opacity').addEventListener('input', () => { $('opacityValue').textContent = `${$('opacity').value}%`; });
+$('recoveryEnabled').addEventListener('change', async () => {
+  if (recoveryRequested !== null || !state?.recovery?.available || state.recovery.busy) { renderRecovery(); return; }
+  recoveryRequested = $('recoveryEnabled').checked;
+  recoveryActionError = '';
+  renderRecovery();
+  try { applyState(await call('setRecoveryEnabled', recoveryRequested)); }
+  catch (error) {
+    try { applyState(await call('state')); } catch { /* Keep the last known recovery state if the refresh fails. */ }
+    recoveryActionError = error.message;
+  } finally { recoveryRequested = null; renderRecovery(); }
+});
 $('settingsForm').addEventListener('submit', async event => {
   event.preventDefault();
   if ($('saveButton').disabled) return;
@@ -202,7 +294,7 @@ $('settingsForm').addEventListener('submit', async event => {
   const controls = [...$('settingsForm').querySelectorAll('input, select, button')].map(control => [control, control.disabled]);
   try {
     const provider = $('settingsProvider').value;
-    const input = { provider, models: { [provider]: $('model').value.trim() }, opacity: Number($('opacity').value) / 100, launchAtLogin: $('launchAtLogin').checked, rememberHistory: $('rememberHistory').checked, hideFromCapture: $('hideFromCapture').checked };
+    const input = { provider, models: { [provider]: $('model').value.trim() }, opacity: Number($('opacity').value) / 100, launchAtLogin: $('launchAtLogin').checked, rememberHistory: $('rememberHistory').checked, hideFromCapture: $('hideFromCapture').checked, protectFromQuit: $('protectFromQuit').checked };
     if ($('apiKey').value.trim()) input.apiKey = $('apiKey').value.trim();
     controls.forEach(([control]) => { control.disabled = true; });
     $('saveButton').textContent = input.apiKey ? 'Verifying and saving key…' : 'Saving…';

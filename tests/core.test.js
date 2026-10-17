@@ -9,10 +9,15 @@ test('preferences reject unsafe input and do not mutate defaults', () => {
   assert.throws(() => validateSettings({ models: { gemini: '../key?x=secret' } }));
   assert.throws(() => validateSettings({ launchAtLogin: 'true' }));
   assert.throws(() => validateSettings({ hideFromCapture: 'true' }));
+  assert.throws(() => validateSettings({ protectFromQuit: 'true' }));
+  assert.equal(validateSettings({}).protectFromQuit, true, 'Existing profiles gain close protection');
+  assert.equal(validateSettings({ protectFromQuit: false }).protectFromQuit, false);
   assert.equal(validateSettings({}).hideFromCapture, true, 'Existing profiles gain capture protection by default');
   assert.equal(validateSettings({ hideFromCapture: false }).hideFromCapture, false);
   const result = validateSettings({ provider: 'gemini', models: { gemini: 'gemini-custom' }, opacity: .7 });
   assert.equal(result.models.gemini, 'gemini-custom'); assert.equal(DEFAULTS.models.gemini, 'gemini-3.8-flash');
+  assert.equal(validateSettings({provider:'openai'}).models.openai,'gpt-6.1-sol');
+  assert.equal(validateSettings({}, {...DEFAULTS,models:{anthropic:'my-existing-model',gemini:'gemini-custom'}}).models.openai,'gpt-6.1-sol');
 });
 test('image-only questions receive a clear default prompt; empty and oversized inputs fail', () => {
   assert.throws(() => validateQuestion({ text: '  ' }));
