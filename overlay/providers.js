@@ -39,6 +39,7 @@ async function validateApiKey(provider, apiKey, { fetchImpl = fetch, timeoutMs =
 }
 
 function buildRequest(provider, model, apiKey, messages) {
+  const attached = message => message.role === 'user' ? (message.images || (message.image ? [message.image] : [])) : [];
   if (provider === 'openai') {
     return {
       url: 'https://api.openai.com/v1/responses',
@@ -46,7 +47,7 @@ function buildRequest(provider, model, apiKey, messages) {
       body: {
         model, instructions: SYSTEM, stream: true, store: false, max_output_tokens: 8192,
         input: messages.map(message => ({ role: message.role, content: [
-          ...(message.image && message.role === 'user' ? [{ type: 'input_image', image_url: `data:${message.image.mime};base64,${message.image.data}` }] : []),
+          ...attached(message).map(image => ({ type: 'input_image', image_url: `data:${image.mime};base64,${image.data}` })),
           { type: message.role === 'assistant' ? 'output_text' : 'input_text', text: message.text }
         ] }))
       }
@@ -59,7 +60,7 @@ function buildRequest(provider, model, apiKey, messages) {
       body: {
         model, max_tokens: 4096, stream: true, system: SYSTEM,
         messages: messages.map(message => ({ role: message.role, content: [
-          ...(message.image ? [{ type: 'image', source: { type: 'base64', media_type: message.image.mime, data: message.image.data } }] : []),
+          ...attached(message).map(image => ({ type: 'image', source: { type: 'base64', media_type: image.mime, data: image.data } })),
           { type: 'text', text: message.text }
         ] }))
       }
@@ -72,7 +73,7 @@ function buildRequest(provider, model, apiKey, messages) {
     body: {
       systemInstruction: { parts: [{ text: SYSTEM }] },
       contents: messages.map(message => ({ role: message.role === 'assistant' ? 'model' : 'user', parts: [
-        ...(message.image ? [{ inlineData: { mimeType: message.image.mime, data: message.image.data } }] : []),
+        ...attached(message).map(image => ({ inlineData: { mimeType: image.mime, data: image.data } })),
         { text: message.text }
       ] })),
       generationConfig: { maxOutputTokens: 4096 }

@@ -6,9 +6,10 @@ const path = require('node:path');
 const os = require('node:os');
 const { randomUUID } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
-const { DEFAULTS, MAX_IMAGE_BYTES, validateSettings, validateQuestion, inspectImage, clampBounds, boundedContext, diskHistory, validateHistory } = require('./core');
+const { DEFAULTS, MAX_IMAGE_BYTES, MAX_IMAGES, imageIds, imageNames, validateSettings, validateQuestion, inspectImage, clampBounds, boundedContext, diskHistory, validateHistory } = require('./core');
 const { streamAnswer, validateApiKey } = require('./providers');
 const { Store } = require('./storage');
+const { InterruptedWork } = require('./interrupted-work');
 const { QuitGuard } = require('./quit-guard');
 const { MacRecovery, recoverySession } = require('./recovery');
 const { MODEL_CATALOG, PROVIDERS, PROVIDER_NAMES } = require('./models');
@@ -16,8 +17,15 @@ const { platformInfo, shortcutLabel, loginOptions, startHidden, startupAvailable
 const platform = platformInfo();
 
 const quitTestMode = !app.isPackaged && process.argv.includes('--quit-smoke-test');
-const testMode = !app.isPackaged && (process.argv.includes('--smoke-test') || quitTestMode);
-if (testMode) app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-test-')));
+const interruptionTestMode = !app.isPackaged && process.argv.includes('--interruption-smoke-test');
+const testMode = !app.isPackaged && (process.argv.includes('--smoke-test') || quitTestMode || interruptionTestMode);
+if (interruptionTestMode) {
+  const profile = path.resolve(process.argv.at(-1));
+  const info = fs.lstatSync(profile);
+  if (path.dirname(profile) !== fs.realpathSync(os.tmpdir()) || !path.basename(profile).startsWith('opencluely-interruption-test-') ||
+    !info.isDirectory() || info.isSymbolicLink()) throw new Error('Interruption tests require a disposable profile.');
+  app.setPath('userData', profile);
+} else if (testMode) app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-test-')));
 app.setName('OpenCluely Overlay');
 if (process.platform === 'win32') app.setAppUserModelId('com.opencluely.overlay');
 
@@ -25,9 +33,10 @@ let win, tray, store, quitting = false, settings, keys = {}, history = [], activ
 let passThrough = false, captureBusy = false, settingsBusy = false, geometryTimer, normalBounds;
 let screenshotRestore = true;
 let launchHidden = false;
-let recovery, initializationComplete = false;
+let recovery, interruptedWork, initializationComplete = false;
 let archivedChats = [];
 const images = new Map(), warnings = [], recoveryTimes = [], shortcuts = [];
+const draftImageIds = new Set();
 const html = path.join(__dirname, 'ui', 'index.html');
 const pageURL = pathToFileURL(html).href;
 let answerFunction = streamAnswer;
@@ -81,8 +90,10 @@ function screenPermission() { return screenPermissionFunction(); }
 function currentState() {
   return {
     settings, history: diskHistory(history), passThrough, busy: !!active, captureBusy,
-    active: active ? { id: active.id, question: active.question, text: active.text, image: active.image ? publicImage(active.image) : null, provider: active.provider, model: active.model } : null,
-    lastAttempt: lastAttempt ? { ...lastAttempt, image: images.has(lastAttempt.question.imageId) ? publicImage(images.get(lastAttempt.question.imageId)) : null } : null,
+    active: active ? { id: active.id, question: active.question, text: active.text, images: active.images.map(publicImage), provider: active.provider, model: active.model } : null,
+    lastAttempt: lastAttempt ? { ...lastAttempt, images: imageIds(lastAttempt.question).map(id => images.get(id)).filter(Boolean).map(publicImage) } : null,
+    maxImages: MAX_IMAGES,
+    draftImages: [...draftImageIds].map(id => images.get(id)).filter(Boolean).map(publicImage),
     keyStatus: Object.fromEntries(PROVIDERS.map(provider => [provider, !!keys[provider]])),
     modelCatalog: MODEL_CATALOG,
     archivedChats: archivedChats.map(({ id, title, updatedAt }) => ({ id, title, updatedAt })),
@@ -108,7 +119,7 @@ function manualReopen() {
     void recovery.enable().catch(() => {});
   }
 }
-function allowSessionEnd() { quitGuard.allowSessionEnd(); recovery?.disarmForSessionEnd(); }
+function allowSessionEnd() { interruptedWork?.flush(); quitGuard.allowSessionEnd(); recovery?.disarmForSessionEnd(); }
 function persistSettings() { store.write('preferences.json', settings); }
 function persistHistory() {
   try {
@@ -116,7 +127,12 @@ function persistHistory() {
       store.write('chats.enc', { current: diskHistory(history), archive: archivedChats }, true);
       store.write('conversation.enc', diskHistory(history), true);
     } else { store.remove('conversation.enc'); store.remove('chats.enc'); }
-  } catch { warn('The conversation could not be saved. It is still available until you quit.'); }
+    return true;
+  } catch { warn('The conversation could not be saved. It is still available until you quit.'); return false; }
+}
+function clearInterruptedWork() {
+  try { interruptedWork?.clear(); }
+  catch { warn('The saved unfinished answer could not be removed. Check available storage and try again.'); }
 }
 function changeConversation(archiveId = null) {
   if (active) throw new Error('Stop the current answer before starting or switching chats.');
@@ -132,7 +148,8 @@ function changeConversation(archiveId = null) {
   if (settings.rememberHistory && store.available()) {
     store.write('chats.enc', { current: diskHistory(nextHistory), archive: nextArchives }, true);
   }
-  archivedChats = nextArchives; history = nextHistory; images.clear(); lastAttempt = null;
+  archivedChats = nextArchives; history = nextHistory; images.clear(); draftImageIds.clear(); lastAttempt = null;
+  clearInterruptedWork();
   persistHistory();
   syncState(); return currentState();
 }
@@ -149,7 +166,8 @@ function applyWindowMode() {
   try { win.setContentProtection(settings.hideFromCapture); }
   catch { warn('Screen capture protection could not be enabled. Check Settings and your sharing preview before sharing.'); }
   win.setAlwaysOnTop(true, 'screen-saver');
-  win.setOpacity(settings.opacity);
+  // Renderer layers control opacity so code boxes never inherit the app fade.
+  win.setOpacity(1);
   win.setIgnoreMouseEvents(passThrough, { forward: true });
   if (passThrough && platform.mac && win.isFocused()) win.blur();
   win.setFocusable(!passThrough);
@@ -193,7 +211,8 @@ function toggleCompact() {
 }
 function recoverRenderer(reason) {
   if (quitting || !win || win.isDestroyed()) return;
-  active?.controller.abort();
+  // Provider requests and their checkpoints live in main. A renderer crash
+  // should not interrupt a healthy request; the reloaded UI receives its state.
   const now = Date.now();
   recoveryTimes.push(now);
   while (recoveryTimes[0] < now - 60000) recoveryTimes.shift();
@@ -211,8 +230,8 @@ function createWindow() {
   normalBounds = clampBounds(saved, display.workArea, false);
   win = new BrowserWindow({
     ...clampBounds(saved, display.workArea, settings.compact), minWidth: 360, minHeight: settings.compact ? 122 : 440,
-    title: 'OpenCluely Overlay', icon: path.join(__dirname, 'assets', 'icon.png'),
-    frame: false, transparent: false, backgroundColor: '#111a18', show: false,
+    title: 'Chat',
+    frame: false, transparent: true, backgroundColor: '#00000000', show: false,
     ...(platform.mac ? { type: 'panel', hiddenInMissionControl: true } : {}),
     alwaysOnTop: true, skipTaskbar: true, autoHideMenuBar: true, maximizable: false, fullscreenable: false,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), partition: 'overlay-memory', nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true, backgroundThrottling: true, spellcheck: false }
@@ -270,13 +289,14 @@ function addImage(native, name) {
   const size = resized.getSize();
   const preview = resized.resize({ width: Math.min(260, size.width), quality: 'good' }).toDataURL();
   const image = { id: randomUUID(), name: String(name || 'Image').slice(0, 160), mime: 'image/jpeg', data: bytes.toString('base64'), preview, ...size };
-  images.set(image.id, image);
-  // Keep a bounded image cache. Old image names remain in history but pixels are released.
-  while (images.size > 10) {
-    const removable = [...images.keys()].find(id => id !== active?.question.imageId && id !== image.id);
-    if (!removable) break;
+  // Composer attachments and all images in a running request must survive
+  // cache eviction. Older history retains attachment names after pixels expire.
+  while (images.size >= MAX_IMAGES * 2) {
+    const removable = [...images.keys()].find(id => !imageIds(active?.question).includes(id) && !draftImageIds.has(id));
+    if (!removable) throw new Error('Image memory is full. Finish the answer or remove a queued image first.');
     images.delete(removable);
   }
+  images.set(image.id, image);
   return publicImage(image);
 }
 function importImage(input) {
@@ -322,28 +342,32 @@ async function ask(input) {
   const question = validateQuestion(input);
   const provider = settings.provider, model = settings.models[provider], apiKey = keys[provider];
   if (!apiKey) throw new Error(`Add your ${PROVIDER_NAMES[provider]} API key in Settings first.`);
-  const image = question.imageId ? images.get(question.imageId) : null;
-  if (question.imageId && !image) throw new Error('This attachment expired. Please attach the image again.');
-  const request = { id: randomUUID(), question, image, provider, model, text: '', controller: new AbortController() };
+  const attachments = question.imageIds.map(id => images.get(id));
+  if (attachments.some(image => !image)) throw new Error('An attachment expired. Please attach the missing image again.');
+  const request = { id: randomUUID(), question, images: attachments, provider, model, text: '', controller: new AbortController() };
   active = request; lastAttempt = null;
-  emit({ type: 'start', id: request.id, question, image: image ? publicImage(image) : null, provider, model });
+  interruptedWork.start(request, history);
+  emit({ type: 'start', id: request.id, question, images: attachments.map(publicImage), provider, model });
   updateTray();
   // Returning immediately lets the UI cancel while the stream is running.
   void (async () => {
     try {
       const answer = await answerFunction({ provider, model, apiKey, messages: boundedContext(history, question, id => images.get(id)), signal: request.controller.signal,
-        onDelta: delta => { request.text += delta; emit({ type: 'delta', id: request.id, text: delta }); },
+        onDelta: delta => { request.text += delta; interruptedWork.update(request, history); emit({ type: 'delta', id: request.id, text: delta }); },
         onStatus: text => emit({ type: 'status', id: request.id, text }) });
       request.controller.signal.throwIfAborted();
+      request.text = answer.text;
+      interruptedWork.start(request, history);
       const createdAt = new Date().toISOString();
-      history.push({ id: randomUUID(), role: 'user', text: question.text, imageId: question.imageId, imageName: image?.name, createdAt },
+      history.push({ id: randomUUID(), role: 'user', text: question.text, imageId: question.imageId, imageIds: question.imageIds, imageName: attachments[0]?.name, imageNames: attachments.map(image => image.name), createdAt },
         { id: request.id, role: 'assistant', text: answer.text, provider, model, createdAt });
       history = history.slice(-40);
-      persistHistory();
+      if (persistHistory()) clearInterruptedWork();
       emit({ type: 'done', id: request.id, text: answer.text, truncated: answer.truncated });
     } catch (error) {
       const message = request.controller.signal.aborted ? 'Answer stopped. You can retry when you are ready.' : error.message;
-      lastAttempt = { id: request.id, question, text: request.text, error: message, provider, model };
+      lastAttempt = { id: request.id, question, text: request.text, error: message, provider, model, imageNames: attachments.map(image => image.name) };
+      interruptedWork.start(request, history);
       emit({ type: 'error', ...lastAttempt }); log('request-failed');
     } finally {
       if (active === request) active = null;
@@ -382,6 +406,7 @@ async function saveSettings(input) {
     if (!('compact' in input)) next.compact = settings.compact;
     const hadCredentials = fs.existsSync(path.join(store.directory, 'credentials.enc'));
     try {
+      if (!next.rememberHistory) interruptedWork.clear();
       if (credentialsChanged) store.write('credentials.enc', nextKeys, true);
       if (startupChanged) {
         app.setLoginItemSettings(loginOptions(next.launchAtLogin, process.execPath));
@@ -397,6 +422,7 @@ async function saveSettings(input) {
       throw error;
     }
     settings = next; keys = nextKeys;
+    if (settings.rememberHistory && lastAttempt) interruptedWork.start(lastAttempt, history);
     applyWindowMode(); persistHistory(); syncState();
     return currentState();
   } finally { settingsBusy = false; }
@@ -417,27 +443,43 @@ async function openScreenSettings() {
 function registerIPC() {
   handle('state', currentState); handle('ask', ask);
   handle('cancel', () => { active?.controller.abort(); return true; });
-  handle('upload', async () => {
-    const result = await dialog.showOpenDialog(win, { title: 'Attach a question image', properties: ['openFile'], filters: [{ name: 'Question images', extensions: ['png', 'jpg', 'jpeg'] }] });
-    if (result.canceled || !result.filePaths[0]) return null;
-    const file = result.filePaths[0];
-    if (fs.statSync(file).size > MAX_IMAGE_BYTES) throw new Error('Choose an image up to 10 MB.');
-    const bytes = fs.readFileSync(file); inspectImage(bytes);
-    return addImage(nativeImage.createFromBuffer(bytes), path.basename(file));
+  handle('set-attachments', ids => {
+    const question = validateQuestion({ text: 'attachments', imageIds: ids });
+    if (question.imageIds.some(id => !images.has(id))) throw new Error('An attachment expired. Attach the image again.');
+    draftImageIds.clear(); for (const id of question.imageIds) draftImageIds.add(id);
+    return true;
+  });
+  handle('upload', async (limit = MAX_IMAGES) => {
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_IMAGES) throw new Error(`Attach up to ${MAX_IMAGES} images per question.`);
+    const result = await dialog.showOpenDialog(win, { title: 'Attach images', properties: ['openFile', 'multiSelections'], filters: [{ name: 'Question images', extensions: ['png', 'jpg', 'jpeg'] }] });
+    if (result.canceled || !result.filePaths.length) return [];
+    if (result.filePaths.length > limit) throw new Error(`Choose up to ${limit} more image${limit === 1 ? '' : 's'}.`);
+    const selected = result.filePaths.map(file => {
+      if (fs.statSync(file).size > MAX_IMAGE_BYTES) throw new Error('Choose images up to 10 MB each.');
+      const bytes = fs.readFileSync(file); inspectImage(bytes);
+      return { native: nativeImage.createFromBuffer(bytes), name: path.basename(file) };
+    });
+    const added = [];
+    try { for (const item of selected) added.push(addImage(item.native, item.name)); return added; }
+    catch (error) { for (const item of added) images.delete(item.id); throw error; }
   });
   handle('paste-image', async () => {
-    for (const item of await clipboard.read()) {
-      const mime = item.types.find(type => ['image/png', 'image/jpeg'].includes(type));
-      if (!mime) continue;
-      const blob = await item.getType(mime);
-      if (blob.size > MAX_IMAGE_BYTES) throw new Error('Choose a PNG or JPEG up to 10 MB.');
-      const bytes = Buffer.from(await blob.arrayBuffer()); inspectImage(bytes);
-      return addImage(nativeImage.createFromBuffer(bytes), 'Clipboard image');
-    }
-    return null;
+    const added = [];
+    try {
+      for (const item of await clipboard.read()) {
+        const mime = item.types.find(type => ['image/png', 'image/jpeg'].includes(type));
+        if (!mime) continue;
+        const blob = await item.getType(mime);
+        if (blob.size > MAX_IMAGE_BYTES) throw new Error('Choose a PNG or JPEG up to 10 MB.');
+        const bytes = Buffer.from(await blob.arrayBuffer()); inspectImage(bytes);
+        if (added.length >= MAX_IMAGES) throw new Error(`Attach up to ${MAX_IMAGES} images per question.`);
+        added.push(addImage(nativeImage.createFromBuffer(bytes), 'Clipboard image'));
+      }
+      return added;
+    } catch (error) { for (const item of added) images.delete(item.id); throw error; }
   });
   handle('import-image', importImage); handle('capture', capture);
-  handle('release-image', id => { if (typeof id === 'string' && !history.some(message => message.imageId === id) && active?.question.imageId !== id && lastAttempt?.question.imageId !== id) images.delete(id); return true; });
+  handle('release-image', id => { draftImageIds.delete(id); if (typeof id === 'string' && !history.some(message => imageIds(message).includes(id)) && !imageIds(active?.question).includes(id) && !imageIds(lastAttempt?.question).includes(id)) images.delete(id); return true; });
   handle('save-settings', saveSettings);
   handle('screen-settings', openScreenSettings);
   handle('set-recovery-enabled', setRecoveryEnabled);
@@ -452,14 +494,15 @@ function registerIPC() {
   handle('clear', () => {
     if (active) throw new Error('Stop the answer before clearing the conversation.');
     // Remove the saved file first, so a disk failure does not falsely report deletion.
+    interruptedWork.clear();
     if (settings.rememberHistory && store.available()) store.write('chats.enc', { current: [], archive: archivedChats }, true);
-    store.remove('conversation.enc'); history = []; lastAttempt = null; images.clear(); syncState(); return true;
+    store.remove('conversation.enc'); history = []; lastAttempt = null; images.clear(); draftImageIds.clear(); syncState(); return true;
   });
   handle('export', async () => {
     if (!history.length) throw new Error('There is no completed conversation to export.');
     const result = await dialog.showSaveDialog(win, { title: 'Export conversation', defaultPath: 'OpenCluely-conversation.md', filters: [{ name: 'Markdown', extensions: ['md'] }] });
     if (result.canceled || !result.filePath) return false;
-    const content = history.map(message => `## ${message.role === 'user' ? 'You' : 'Assistant'}\n\n${message.imageName ? `[Image: ${message.imageName}]\n\n` : ''}${message.text}\n`).join('\n');
+    const content = history.map(message => `## ${message.role === 'user' ? 'You' : 'Assistant'}\n\n${imageNames(message).map(name => `[Image: ${name}]\n\n`).join('')}${message.text}\n`).join('\n');
     fs.writeFileSync(result.filePath, content, 'utf8'); return true;
   });
   handle('hide', hideOverlay); handle('pass-through', togglePassThrough); handle('compact', toggleCompact);
@@ -471,7 +514,7 @@ function registerShortcuts() {
     ['CommandOrControl+Alt+Space', 'Show / hide', toggleVisibility],
     ['CommandOrControl+Alt+I', 'Click-through', togglePassThrough],
     ['CommandOrControl+Alt+S', 'Screenshot', async () => {
-      try { const image = await capture(); showOverlay(true); emit({ type: 'attach', image }); }
+      try { if (draftImageIds.size >= MAX_IMAGES) throw new Error(`Attach up to ${MAX_IMAGES} images per question. Remove one before taking another screenshot.`); const image = await capture(); showOverlay(true); emit({ type: 'attach', image }); }
       catch (error) { showOverlay(false); emit({ type: 'notice', text: error.message }); }
     }]
   ];
@@ -531,6 +574,9 @@ async function initialize() {
       if (saved !== null) history = validateHistory(saved.current);
     } catch { warn('Previous chats could not be restored. The original file is preserved until the next successful save.'); }
   }
+  interruptedWork = new InterruptedWork({ store, enabled: () => settings.rememberHistory && store.available(), report: warn });
+  // Temporary Keychain unavailability must not delete an existing checkpoint.
+  lastAttempt = store.available() ? interruptedWork.restore(history) : null;
   const overlaySession = session.fromPartition('overlay-memory');
   overlaySession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   overlaySession.setPermissionCheckHandler(() => false);
@@ -555,11 +601,11 @@ async function initialize() {
   initializationComplete = true;
   log('app-ready');
   if (testMode) {
-    await require(quitTestMode ? '../tests/quit-electron' : '../tests/smoke-electron').run({ app, getWindow: () => win, store, currentState, ask, saveSettings, importImage, capture, images, showOverlay, hideOverlay, togglePassThrough, toggleCompact, requestQuit, setRecoveryEnabled, changeConversation,
+    await require(interruptionTestMode ? '../tests/interruption-electron' : quitTestMode ? '../tests/quit-electron' : '../tests/smoke-electron').run({ app, getWindow: () => win, store, currentState, ask, saveSettings, importImage, capture, images, showOverlay, hideOverlay, togglePassThrough, toggleCompact, requestQuit, setRecoveryEnabled, changeConversation,
       setQuitConfirmationFunction: fn => { quitConfirmationFunction = fn; },
       setRecoveryController: controller => { const previous = recovery; recovery = controller; syncState(); return previous; },
       setAnswerFunction: fn => { answerFunction = fn; }, setKeyValidator: fn => { keyValidator = fn; }, setScreenPermissionFunction: fn => { screenPermissionFunction = fn; }, cancel: () => active?.controller.abort(), clear: () => { history = []; images.clear(); lastAttempt = null; persistHistory(); syncState(); },
-      getHistory: () => history });
+      getHistory: () => history, interruptedWork });
   }
 }
 
@@ -570,6 +616,7 @@ else {
   app.on('window-all-closed', () => { /* The tray owns lifetime; closing the UI keeps the app running. */ });
   app.on('before-quit', event => {
     if (quitGuard.preventQuit()) { event.preventDefault(); return; }
+    interruptedWork?.flush();
     quitting = true; active?.controller.abort(); clearTimeout(geometryTimer);
     if (settings && store) {
       if (win && !win.isDestroyed()) { const bounds = win.getBounds(); settings.bounds = { ...bounds, height: settings.compact ? normalBounds?.height || 700 : bounds.height }; }

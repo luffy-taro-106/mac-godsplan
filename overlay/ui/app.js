@@ -1,7 +1,9 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const api = window.overlay;
-let state, attachment = null, sending = false, importing = false, streamTimer, toastTimer, streamView, renderedSignature = '', autoScroll = true, dragDepth = 0;
+let state, attachments = [], sending = false, importing = false, streamTimer, toastTimer, streamView, renderedSignature = '', autoScroll = true, dragDepth = 0;
+const MAX_IMAGES = 10;
+let composerInitialized = false;
 const models = {};
 let deletingChatId = null;
 const question = $('question');
@@ -9,6 +11,44 @@ const messageContainer = $('messages');
 const content = $('content');
 let selectedDisplay = sessionStorage.getItem('display') || '';
 let recoveryRequested = null, recoveryActionError = '';
+let backdropFrame = 0;
+
+// The app background has holes behind visible code boxes. Otherwise an opaque
+// app background would impose a minimum opacity on a translucent code box.
+function updateBackdrop() {
+  backdropFrame = 0;
+  const width = innerWidth, height = innerHeight;
+  let path = `M0 0H${width}V${height}H0Z`;
+  const viewport = content.getBoundingClientRect();
+  const rightEdge = viewport.left + content.clientWidth;
+  if (content.clientHeight) for (const pre of messageContainer.querySelectorAll('pre')) {
+    const rect = pre.getBoundingClientRect();
+    const left = Math.max(0, viewport.left, rect.left), right = Math.min(width, rightEdge, rect.right);
+    const top = Math.max(0, viewport.top, rect.top), bottom = Math.min(height, viewport.bottom, rect.bottom);
+    if (right <= left || bottom <= top) continue;
+    const radius = Math.min(parseFloat(getComputedStyle(pre).borderTopLeftRadius) || 0, (right - left) / 2, (bottom - top) / 2);
+    const tl = top === rect.top && left === rect.left ? radius : 0;
+    const tr = top === rect.top && right === rect.right ? radius : 0;
+    const br = bottom === rect.bottom && right === rect.right ? radius : 0;
+    const bl = bottom === rect.bottom && left === rect.left ? radius : 0;
+    path += `M${left + tl} ${top}H${right - tr}Q${right} ${top} ${right} ${top + tr}V${bottom - br}Q${right} ${bottom} ${right - br} ${bottom}H${left + bl}Q${left} ${bottom} ${left} ${bottom - bl}V${top + tl}Q${left} ${top} ${left + tl} ${top}Z`;
+  }
+  $('appBackdrop').style.setProperty('--code-cutouts', `path(evenodd, "${path}")`);
+}
+function scheduleBackdrop() { if (!backdropFrame) backdropFrame = requestAnimationFrame(updateBackdrop); }
+
+function fadeProse(element) {
+  for (const node of [...element.childNodes]) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      if (node.matches('pre')) continue;
+      if (node.querySelector('pre')) { node.classList.add('contains-code'); fadeProse(node); }
+      else node.classList.add('app-opacity');
+    } else if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) {
+      const span = document.createElement('span'); span.className = 'app-opacity';
+      node.replaceWith(span); span.append(node);
+    }
+  }
+}
 
 async function call(method, ...args) {
   const result = await api[method](...args);
@@ -32,6 +72,8 @@ function richText(element, text) {
     copy.addEventListener('click', guard(async () => { await call('copy', pre.querySelector('code')?.textContent || pre.textContent); copy.textContent = 'Copied'; setTimeout(() => { copy.textContent = 'Copy'; }, 1300); }));
     pre.prepend(copy);
   });
+  fadeProse(element);
+  scheduleBackdrop();
   element.querySelectorAll('a').forEach(link => link.addEventListener('click', guard(async event => {
     event.preventDefault(); const url = link.getAttribute('href');
     if (url && /^https?:\/\//i.test(url)) { await call('copy', url); notify('Link copied. Paste it into your browser to open it.'); }
@@ -40,12 +82,12 @@ function richText(element, text) {
 function createMessage(role, text, metadata = {}) {
   const card = document.createElement('article'); card.className = `message ${role}`;
   const header = document.createElement('div'); header.className = 'message-header';
-  if (role === 'assistant') header.append(icon('spark'));
   const label = document.createElement('span'); label.textContent = role === 'user' ? 'YOU' : metadata.provider === 'openai' ? 'CHATGPT' : metadata.provider === 'gemini' ? 'GEMINI' : 'CLAUDE'; header.append(label);
   if (role === 'assistant' && metadata.model) { const model = document.createElement('span'); model.className = 'model-label'; model.textContent = metadata.model; header.append(model); }
   card.append(header);
-  if (metadata.imageName || metadata.image?.name) {
-    const reference = document.createElement('div'); reference.className = 'image-reference'; reference.append(icon('image'), document.createTextNode(metadata.imageName || metadata.image.name)); card.append(reference);
+  const imageNames = metadata.imageNames || metadata.images?.map(image => image.name) || (metadata.imageName ? [metadata.imageName] : []);
+  for (const name of imageNames) {
+    const reference = document.createElement('div'); reference.className = 'image-reference'; reference.append(icon('image'), document.createTextNode(name)); card.append(reference);
   }
   const body = document.createElement('div'); body.className = 'message-body';
   if (role === 'user') body.textContent = text;
@@ -64,8 +106,13 @@ function addCopy(card, text) {
 function showFailure(view, attempt) {
   if (attempt.text) richText(view.body, attempt.text); else view.body.textContent = '';
   const error = document.createElement('div'); error.className = 'message-error'; error.textContent = attempt.error; view.card.append(error);
-  const retry = document.createElement('button'); retry.className = 'retry-button'; retry.type = 'button'; retry.textContent = 'Retry question';
-  retry.addEventListener('click', guard(() => submit(attempt.question))); view.card.append(retry);
+  const retry = document.createElement('button'); retry.className = 'retry-button'; retry.type = 'button'; retry.textContent = attempt.needsAttachment ? 'Restore question to attach image' : 'Retry question';
+  retry.addEventListener('click', guard(() => {
+    if (!attempt.needsAttachment) return submit(attempt.question);
+    question.value = attempt.question.text; sessionStorage.setItem('draft', question.value);
+    resizeQuestion(); updateControls(); question.focus();
+    notify('Attach the original images again, then send the question.');
+  })); view.card.append(retry);
   if (attempt.text) addCopy(view.card, attempt.text);
 }
 function renderTimeline() {
@@ -76,11 +123,11 @@ function renderTimeline() {
   clearTimeout(streamTimer); messageContainer.replaceChildren(); streamView = null;
   for (const message of state.history) createMessage(message.role, message.text, message);
   if (state.active) {
-    createMessage('user', state.active.question.text, { image: state.active.image });
+    createMessage('user', state.active.question.text, { images: state.active.images });
     streamView = createMessage('assistant', state.active.text, { ...state.active, streaming: true });
     if (!state.active.text) streamView.body.innerHTML = '<div class="streaming-indicator"><span></span><span></span><span></span></div>';
   } else if (state.lastAttempt) {
-    createMessage('user', state.lastAttempt.question.text, { image: state.lastAttempt.image });
+    createMessage('user', state.lastAttempt.question.text, { images: state.lastAttempt.images, imageNames: state.lastAttempt.imageNames, imageName: state.lastAttempt.imageName });
     const view = createMessage('assistant', '', state.lastAttempt); showFailure(view, state.lastAttempt);
   }
   $('welcome').hidden = !!(state.history.length || state.active || state.lastAttempt);
@@ -88,15 +135,17 @@ function renderTimeline() {
 }
 function updateControls() {
   const busy = sending || !!state?.busy;
-  $('sendButton').disabled = busy || importing || !(question.value.trim() || attachment);
+  $('sendButton').disabled = busy || importing || !(question.value.trim() || attachments.length);
   $('provider').disabled = busy;
   $('quickModel').disabled = busy;
   $('newChatButton').disabled = busy || importing || !!state?.captureBusy;
   $('newChatButton').title = busy ? 'Stop the answer before starting a new chat' : 'Save this conversation and start a new one';
   $('openChatButton').disabled = busy || !$('chatSelect').value;
   $('deleteChatButton').disabled = !$('chatSelect').value;
-  $('captureButton').disabled = !!state?.captureBusy || importing;
-  $('uploadButton').disabled = importing;
+  $('captureButton').disabled = !!state?.captureBusy || importing || attachments.length >= MAX_IMAGES;
+  $('uploadButton').disabled = importing || attachments.length >= MAX_IMAGES;
+  $('removeImages').disabled = importing || sending;
+  document.querySelectorAll('.remove-image').forEach(button => { button.disabled = importing || sending; });
   $('requestStatus').hidden = !busy;
   $('footerStatus').textContent = busy ? 'Answering your question' : state?.passThrough ? 'Click-through enabled' : `Runs in your ${state?.platform.trayName || 'tray'}`;
 }
@@ -116,6 +165,10 @@ function renderRecovery() {
 }
 function applyState(value) {
   state = value;
+  document.documentElement.style.setProperty('--app-opacity', String(state.settings.opacity));
+  document.documentElement.style.setProperty('--code-box-opacity', String(state.settings.codeOpacity ?? 1));
+  scheduleBackdrop();
+  if (!composerInitialized) { attachments = value.draftImages || []; composerInitialized = true; renderAttachments(); }
   recoveryActionError = '';
   for (const shortcut of state.shortcuts) {
     document.querySelectorAll('[data-shortcut]').forEach(element => { if (element.dataset.shortcut === shortcut.label) element.textContent = shortcut.display; });
@@ -146,28 +199,59 @@ function applyState(value) {
   $('settingsWarnings').textContent = state.warnings.join('\n'); $('settingsWarnings').hidden = !state.warnings.length;
   renderTimeline(); updateControls(); renderRecovery();
 }
-function setAttachment(image) {
-  if (attachment && attachment.id !== image?.id) void call('releaseImage', attachment.id).catch(() => {});
-  attachment = image;
-  $('attachment').hidden = !image;
-  if (image) { $('imagePreview').src = image.preview; $('imageName').textContent = image.name; $('imageSize').textContent = `${image.width} × ${image.height} · ready to send`; }
-  else { $('imagePreview').removeAttribute('src'); }
-  updateControls();
+function renderAttachments() {
+  $('attachment').hidden = !attachments.length;
+  $('attachmentCount').textContent = `${attachments.length} / ${MAX_IMAGES} images`;
+  $('attachmentList').replaceChildren();
+  for (const image of attachments) {
+    const row = document.createElement('div'); row.className = 'attachment'; row.dataset.imageId = image.id;
+    const preview = document.createElement('img'); preview.src = image.preview; preview.alt = image.name;
+    const info = document.createElement('div');
+    const name = document.createElement('strong'); name.textContent = image.name;
+    const size = document.createElement('span'); size.textContent = `${image.width} × ${image.height}`;
+    info.append(name, size);
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'icon-button remove-image';
+    remove.setAttribute('aria-label', `Remove ${image.name}`); remove.title = `Remove ${image.name}`; remove.append(icon('close'));
+    remove.addEventListener('click', guard(() => removeAttachments(image.id)));
+    row.append(preview, info, remove); $('attachmentList').append(row);
+  }
 }
-async function loadAttachment(action) {
-  if (importing) return;
+async function setAttachments(next) {
+  await call('setAttachments', next.map(image => image.id));
+  const previous = attachments; attachments = next;
+  renderAttachments(); updateControls();
+  for (const image of previous) if (!next.some(item => item.id === image.id)) void call('releaseImage', image.id).catch(() => {});
+}
+async function removeAttachments(id = null) {
+  if (importing || sending) return;
   importing = true; updateControls();
-  try { const image = await action(); if (image) { setAttachment(image); question.focus(); } }
+  try { await setAttachments(id ? attachments.filter(image => image.id !== id) : []); }
   finally { importing = false; updateControls(); }
 }
-async function submit(input = { text: question.value, imageId: attachment?.id }) {
-  if (sending || state?.busy) return;
+async function loadAttachments(action) {
+  if (importing || sending) return;
+  if (attachments.length >= MAX_IMAGES) throw new Error(`Attach up to ${MAX_IMAGES} images per question. Remove one to add another.`);
+  importing = true; updateControls();
+  let added = [];
+  try {
+    const result = await action(MAX_IMAGES - attachments.length);
+    added = (Array.isArray(result) ? result : result ? [result] : []).filter(image => !attachments.some(item => item.id === image.id));
+    if (added.length + attachments.length > MAX_IMAGES) throw new Error(`Attach up to ${MAX_IMAGES} images per question.`);
+    if (added.length) { await setAttachments([...attachments, ...added]); question.focus(); }
+  } catch (error) {
+    for (const image of added) void call('releaseImage', image.id).catch(() => {});
+    throw error;
+  }
+  finally { importing = false; updateControls(); }
+}
+async function submit(input = { text: question.value, imageIds: attachments.map(image => image.id) }) {
+  if (sending || importing || state?.busy) return;
   if (!state?.keyStatus[state.settings.provider]) { openSettings(); notify('Add your API key to start answering questions.'); return; }
-  if (!input.text?.trim() && !input.imageId) return;
+  if (!input.text?.trim() && !input.imageId && !input.imageIds?.length) return;
   sending = true; updateControls(); autoScroll = true;
   try {
     await call('ask', input);
-    question.value = ''; sessionStorage.removeItem('draft'); resizeQuestion(); setAttachment(null);
+    question.value = ''; sessionStorage.removeItem('draft'); resizeQuestion(); await setAttachments([]);
   } finally { sending = false; updateControls(); }
 }
 function resizeQuestion() { question.style.height = 'auto'; question.style.height = `${Math.min(140, Math.max(40, question.scrollHeight))}px`; }
@@ -195,8 +279,8 @@ function updateCustomModel() {
   $('model').required = custom;
   if (!custom) $('model').value = $('modelPreset').value;
 }
-function resetComposer() {
-  question.value = ''; sessionStorage.removeItem('draft'); setAttachment(null); resizeQuestion();
+async function resetComposer() {
+  question.value = ''; sessionStorage.removeItem('draft'); await setAttachments([]); resizeQuestion();
   autoScroll = true; $('settingsDialog').close(); question.focus();
 }
 function openSettings() {
@@ -204,6 +288,7 @@ function openSettings() {
   if (state.settings.compact) { void call('compact').then(() => openSettings()).catch(error => notify(error.message)); return; }
   $('settingsProvider').value = state.settings.provider; populateKeyFields();
   $('opacity').value = Math.round(state.settings.opacity * 100); $('opacityValue').textContent = `${$('opacity').value}%`;
+  $('codeOpacity').value = Math.round((state.settings.codeOpacity ?? 1) * 100); $('codeOpacityValue').textContent = `${$('codeOpacity').value}%`;
   $('launchAtLogin').checked = state.settings.launchAtLogin; $('rememberHistory').checked = state.settings.rememberHistory;
   $('protectFromQuit').checked = state.settings.protectFromQuit;
   $('hideFromCapture').checked = state.settings.hideFromCapture;
@@ -223,7 +308,7 @@ api.onEvent(event => {
   if (event.type === 'state') applyState(event.value);
   else if (event.type === 'start') {
     state.busy = true; state.active = { ...event, text: '' }; state.lastAttempt = null;
-    $('statusText').textContent = event.image ? 'Reading the image and your question…' : 'Thinking through your question…';
+    $('statusText').textContent = event.images?.length ? `Reading ${event.images.length} image${event.images.length === 1 ? '' : 's'} and your question…` : 'Thinking through your question…';
     renderTimeline(); updateControls();
   } else if (event.type === 'delta' && streamView?.id === event.id) {
     streamView.text += event.text;
@@ -237,7 +322,11 @@ api.onEvent(event => {
   } else if (event.type === 'error' && streamView?.id === event.id) {
     clearTimeout(streamTimer); streamTimer = null; showFailure(streamView, event); scrollToLatest();
   } else if (event.type === 'status') $('statusText').textContent = event.text;
-  else if (event.type === 'attach') { setAttachment(event.image); if (state?.settings.compact) void call('compact').catch(error => notify(error.message)); }
+  else if (event.type === 'attach') {
+    if (importing || sending || attachments.length >= MAX_IMAGES) { void call('releaseImage', event.image.id); notify('Remove an image or wait for the current operation before adding another.'); return; }
+    void loadAttachments(() => event.image).catch(error => notify(error.message));
+    if (state?.settings.compact) void call('compact').catch(error => notify(error.message));
+  }
   else if (event.type === 'notice') notify(event.text);
   else if (event.type === 'open-settings') openSettings();
   else if (event.type === 'focus-input') { if (!state?.settings.compact) question.focus(); }
@@ -246,10 +335,9 @@ api.onEvent(event => {
 $('questionForm').addEventListener('submit', guard(async event => { event.preventDefault(); await submit(); }));
 question.addEventListener('input', () => { sessionStorage.setItem('draft', question.value); resizeQuestion(); updateControls(); });
 question.addEventListener('keydown', guard(async event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); await submit(); } }));
-$('uploadButton').addEventListener('click', guard(() => loadAttachment(() => call('upload'))));
-$('welcomeUpload').addEventListener('click', guard(() => loadAttachment(() => call('upload'))));
-$('captureButton').addEventListener('click', guard(() => loadAttachment(() => call('capture', selectedDisplay || undefined))));
-$('removeImage').addEventListener('click', () => setAttachment(null));
+$('uploadButton').addEventListener('click', guard(() => loadAttachments(limit => call('upload', limit))));
+$('captureButton').addEventListener('click', guard(() => loadAttachments(() => call('capture', selectedDisplay || undefined))));
+$('removeImages').addEventListener('click', guard(() => removeAttachments()));
 $('hideButton').addEventListener('click', guard(() => call('hide')));
 $('compactButton').addEventListener('click', guard(() => call('compact')));
 $('passButton').addEventListener('click', guard(() => call('passThrough')));
@@ -259,9 +347,9 @@ $('quickModel').addEventListener('change', guard(async () => {
   try { applyState(await call('saveSettings', { models: { [state.settings.provider]: $('quickModel').value } })); }
   finally { fillModelOptions($('quickModel'), state.settings.provider, models[state.settings.provider]); }
 }));
-$('newChatButton').addEventListener('click', guard(async () => { applyState(await call('newChat')); resetComposer(); notify('New chat started. Previous conversation is in Settings → Previous chats.'); }));
+$('newChatButton').addEventListener('click', guard(async () => { applyState(await call('newChat')); await resetComposer(); notify('New chat started. Previous conversation is in Settings → Previous chats.'); }));
 $('chatSelect').addEventListener('change', updateControls);
-$('openChatButton').addEventListener('click', guard(async () => { applyState(await call('openChat', $('chatSelect').value)); resetComposer(); }));
+$('openChatButton').addEventListener('click', guard(async () => { applyState(await call('openChat', $('chatSelect').value)); await resetComposer(); }));
 $('deleteChatButton').addEventListener('click', () => {
   deletingChatId = $('chatSelect').value;
   $('deleteChatTitle').textContent = (state.archivedChats || []).find(chat => chat.id === deletingChatId)?.title || '';
@@ -276,6 +364,7 @@ $('settingsDialog').addEventListener('close', () => { $('apiKey').value = ''; })
 $('settingsProvider').addEventListener('change', populateKeyFields);
 $('modelPreset').addEventListener('change', updateCustomModel);
 $('opacity').addEventListener('input', () => { $('opacityValue').textContent = `${$('opacity').value}%`; });
+$('codeOpacity').addEventListener('input', () => { $('codeOpacityValue').textContent = `${$('codeOpacity').value}%`; });
 $('recoveryEnabled').addEventListener('change', async () => {
   if (recoveryRequested !== null || !state?.recovery?.available || state.recovery.busy) { renderRecovery(); return; }
   recoveryRequested = $('recoveryEnabled').checked;
@@ -294,7 +383,7 @@ $('settingsForm').addEventListener('submit', async event => {
   const controls = [...$('settingsForm').querySelectorAll('input, select, button')].map(control => [control, control.disabled]);
   try {
     const provider = $('settingsProvider').value;
-    const input = { provider, models: { [provider]: $('model').value.trim() }, opacity: Number($('opacity').value) / 100, launchAtLogin: $('launchAtLogin').checked, rememberHistory: $('rememberHistory').checked, hideFromCapture: $('hideFromCapture').checked, protectFromQuit: $('protectFromQuit').checked };
+    const input = { provider, models: { [provider]: $('model').value.trim() }, opacity: Number($('opacity').value) / 100, codeOpacity: Number($('codeOpacity').value) / 100, launchAtLogin: $('launchAtLogin').checked, rememberHistory: $('rememberHistory').checked, hideFromCapture: $('hideFromCapture').checked, protectFromQuit: $('protectFromQuit').checked };
     if ($('apiKey').value.trim()) input.apiKey = $('apiKey').value.trim();
     controls.forEach(([control]) => { control.disabled = true; });
     $('saveButton').textContent = input.apiKey ? 'Verifying and saving key…' : 'Saving…';
@@ -308,9 +397,9 @@ $('removeKey').addEventListener('click', guard(async () => { applyState(await ca
 $('exportButton').addEventListener('click', guard(async () => { if (await call('export')) notify('Conversation exported.'); }));
 $('clearButton').addEventListener('click', () => { $('clearDialog').showModal(); });
 $('cancelClear').addEventListener('click', () => $('clearDialog').close());
-$('confirmClear').addEventListener('click', guard(async () => { await call('clear'); setAttachment(null); $('clearDialog').close(); $('settingsDialog').close(); notify('Conversation cleared.'); }));
+$('confirmClear').addEventListener('click', guard(async () => { await call('clear'); await setAttachments([]); $('clearDialog').close(); $('settingsDialog').close(); notify('Conversation cleared.'); }));
 $('quitButton').addEventListener('click', guard(() => call('quit')));
-content.addEventListener('scroll', () => { autoScroll = content.scrollHeight - content.scrollTop - content.clientHeight < 65; $('jumpButton').hidden = autoScroll || !(state?.history.length || state?.active); });
+content.addEventListener('scroll', () => { scheduleBackdrop(); autoScroll = content.scrollHeight - content.scrollTop - content.clientHeight < 65; $('jumpButton').hidden = autoScroll || !(state?.history.length || state?.active); });
 $('jumpButton').addEventListener('click', () => { autoScroll = true; scrollToLatest(true); });
 
 async function attachFile(file) {
@@ -318,17 +407,27 @@ async function attachFile(file) {
   const data = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1]); reader.onerror = () => reject(new Error('The image could not be read.')); reader.readAsDataURL(file); });
   return call('importImage', { name: file.name || 'Pasted image', data });
 }
+async function attachFiles(files, limit) {
+  if (files.length > limit) throw new Error(`Choose up to ${limit} more image${limit === 1 ? '' : 's'}.`);
+  const added = [];
+  try { for (const file of files) added.push(await attachFile(file)); return added; }
+  catch (error) { for (const image of added) void call('releaseImage', image.id); throw error; }
+}
 document.addEventListener('paste', guard(async event => {
   if ($('settingsDialog').open) return;
-  const image = [...event.clipboardData.items].find(item => item.type.startsWith('image/'));
-  if (image) { event.preventDefault(); await loadAttachment(() => attachFile(image.getAsFile())); }
+  const images = [...event.clipboardData.items].filter(item => item.type.startsWith('image/')).map(item => item.getAsFile());
+  if (images.length) { event.preventDefault(); await loadAttachments(limit => attachFiles(images, limit)); }
 }));
 document.addEventListener('dragenter', event => { if ([...event.dataTransfer.types].includes('Files')) { event.preventDefault(); dragDepth++; $('dropZone').hidden = false; } });
 document.addEventListener('dragover', event => { event.preventDefault(); });
 document.addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) $('dropZone').hidden = true; });
-document.addEventListener('drop', guard(async event => { event.preventDefault(); dragDepth = 0; $('dropZone').hidden = true; await loadAttachment(() => attachFile(event.dataTransfer.files[0])); }));
+document.addEventListener('drop', guard(async event => { event.preventDefault(); dragDepth = 0; $('dropZone').hidden = true; await loadAttachments(limit => attachFiles([...event.dataTransfer.files], limit)); }));
 document.addEventListener('keydown', event => { if (event.key === 'Escape' && !$('settingsDialog').open && !$('clearDialog').open) void call('hide').catch(error => notify(error.message)); });
 window.addEventListener('error', () => notify('A display error occurred. Reopen the overlay from the tray.'));
 window.addEventListener('unhandledrejection', () => notify('An action could not finish. Please try again.'));
 question.value = sessionStorage.getItem('draft') || ''; resizeQuestion();
+const backdropResize = new ResizeObserver(scheduleBackdrop);
+for (const element of [$('shell'), content, messageContainer]) backdropResize.observe(element);
+new MutationObserver(scheduleBackdrop).observe(messageContainer, { childList: true, subtree: true, characterData: true });
+window.addEventListener('resize', scheduleBackdrop);
 void call('state').then(applyState).catch(error => notify(error.message));

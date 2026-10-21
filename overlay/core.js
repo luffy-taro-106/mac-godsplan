@@ -2,11 +2,15 @@
 
 const MAX_TEXT = 12000;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGES = 10;
+const MAX_CONTEXT_IMAGES = 10;
+const imageIds = value => Array.isArray(value?.imageIds) ? value.imageIds : value?.imageId ? [value.imageId] : [];
+const imageNames = value => Array.isArray(value?.imageNames) ? value.imageNames : value?.imageName ? [value.imageName] : [];
 const { PROVIDERS } = require('./models');
 const DEFAULTS = Object.freeze({
   provider: 'anthropic',
   models: { anthropic: 'claude-sonnet-5-5', gemini: 'gemini-3.8-flash', openai: 'gpt-6.1-sol' },
-  opacity: 0.98, launchAtLogin: false, rememberHistory: true, hideFromCapture: true, protectFromQuit: true,
+  opacity: 0.98, codeOpacity: 1, launchAtLogin: false, rememberHistory: true, hideFromCapture: true, protectFromQuit: true,
   bounds: null, compact: false
 });
 
@@ -25,8 +29,12 @@ function validateSettings(input, current = DEFAULTS) {
     }
   }
   if ('opacity' in input) {
-    if (!Number.isFinite(input.opacity) || input.opacity < 0.65 || input.opacity > 1) throw new Error('Opacity must be between 65% and 100%.');
+    if (!Number.isFinite(input.opacity) || input.opacity < 0.1 || input.opacity > 1) throw new Error('Opacity must be between 10% and 100%.');
     next.opacity = input.opacity;
+  }
+  if ('codeOpacity' in input) {
+    if (!Number.isFinite(input.codeOpacity) || input.codeOpacity < 0.1 || input.codeOpacity > 1) throw new Error('Code box opacity must be between 10% and 100%.');
+    next.codeOpacity = input.codeOpacity;
   }
   for (const key of ['launchAtLogin', 'rememberHistory', 'compact', 'hideFromCapture', 'protectFromQuit']) {
     if (key in input) {
@@ -41,10 +49,12 @@ function validateQuestion(input) {
   if (!input || typeof input !== 'object') throw new Error('Enter a question.');
   const text = typeof input.text === 'string' ? input.text.trim() : '';
   if (text.length > MAX_TEXT) throw new Error('Question is too long (12,000 characters maximum).');
-  const imageId = input.imageId || null;
-  if (imageId && (typeof imageId !== 'string' || !/^[0-9a-f-]{36}$/.test(imageId))) throw new Error('Invalid attachment.');
-  if (!text && !imageId) throw new Error('Type a question or attach an image.');
-  return { text: text || 'Read the question in this image and answer it. If any part is unclear, say so.', imageId };
+  if ('imageIds' in input && !Array.isArray(input.imageIds)) throw new Error('Invalid attachments.');
+  const ids = imageIds(input);
+  if (ids.length > MAX_IMAGES) throw new Error(`Attach up to ${MAX_IMAGES} images per question.`);
+  if (ids.some(id => typeof id !== 'string' || !/^[0-9a-f-]{36}$/.test(id)) || new Set(ids).size !== ids.length) throw new Error('Invalid attachment.');
+  if (!text && !ids.length) throw new Error('Type a question or attach an image.');
+  return { text: text || `Read the question in ${ids.length === 1 ? 'this image' : 'these images'} and answer it. If any part is unclear, say so.`, imageId: ids[0] || null, imageIds: [...ids] };
 }
 
 // Inspect dimensions before invoking a native decoder, including JPEG SOF markers.
@@ -91,30 +101,40 @@ function clampBounds(saved, workArea, compact = false) {
 function boundedContext(history, current, imageLookup) {
   const pairs = [];
   let chars = current.text.length;
-  let images = current.imageId ? 1 : 0;
+  const currentImages = imageIds(current).map(imageLookup).filter(Boolean);
+  let count = currentImages.length;
+  let bytes = currentImages.reduce((sum, image) => sum + Buffer.byteLength(image.data || '', 'base64'), 0);
   for (let i = history.length - 2; i >= 0 && pairs.length < 8; i -= 2) {
     const user = history[i], answer = history[i + 1];
     if (user?.role !== 'user' || answer?.role !== 'assistant') continue;
     if (chars + user.text.length + answer.text.length > 48000) break;
     chars += user.text.length + answer.text.length;
-    const image = images < 3 && user.imageId ? imageLookup(user.imageId) : null;
-    if (image) images++;
-    const text = user.imageName && !image ? `${user.text}\n[An image named "${user.imageName}" was attached earlier. Its pixels are not available in this request.]` : user.text;
-    pairs.unshift([{ role: 'user', text, image }, { role: 'assistant', text: answer.text }]);
+    const ids = imageIds(user), names = imageNames(user), included = [], missing = [];
+    for (let index = 0; index < Math.max(ids.length, names.length); index++) {
+      const image = ids[index] ? imageLookup(ids[index]) : null;
+      const size = image ? Buffer.byteLength(image.data || '', 'base64') : 0;
+      if (image && count < MAX_CONTEXT_IMAGES && bytes + size <= 20 * 1024 * 1024) {
+        included.push(image); count++; bytes += size;
+      } else if (names[index]) missing.push(names[index]);
+    }
+    const text = missing.length ? `${user.text}\n[Earlier images: ${missing.join(', ')}. Their pixels are not available in this request.]` : user.text;
+    pairs.unshift([{ role: 'user', text, images: included, image: included[0] || null }, { role: 'assistant', text: answer.text }]);
   }
-  return [...pairs.flat(), { role: 'user', text: current.text, image: current.imageId ? imageLookup(current.imageId) : null }];
+  return [...pairs.flat(), { role: 'user', text: current.text, images: currentImages, image: currentImages[0] || null }];
 }
 
 function diskHistory(history) {
-  return history.slice(-40).map(({ id, role, text, imageName, model, provider, createdAt }) => ({ id, role, text, imageName, model, provider, createdAt }));
+  return history.slice(-40).map(({ id, role, text, imageName, imageNames, model, provider, createdAt }) => ({ id, role, text, imageName, model, provider, createdAt,
+    ...(Array.isArray(imageNames) ? { imageNames: imageNames.slice(0, MAX_IMAGES) } : {}) }));
 }
 
 function validateHistory(value) {
   if (!Array.isArray(value)) throw new Error('Invalid conversation data.');
   const clean = value.slice(-40);
   if (clean.length % 2 || clean.some((message, i) => !message || message.role !== (i % 2 ? 'assistant' : 'user') ||
-    typeof message.text !== 'string' || message.text.length > 80000 || typeof message.id !== 'string')) throw new Error('Invalid conversation data.');
+    typeof message.text !== 'string' || message.text.length > 80000 || typeof message.id !== 'string' ||
+    (message.imageNames !== undefined && (!Array.isArray(message.imageNames) || message.imageNames.length > MAX_IMAGES || message.imageNames.some(name => typeof name !== 'string' || name.length > 255))))) throw new Error('Invalid conversation data.');
   return diskHistory(clean);
 }
 
-module.exports = { DEFAULTS, MAX_TEXT, MAX_IMAGE_BYTES, validateSettings, validateQuestion, inspectImage, clampBounds, boundedContext, diskHistory, validateHistory };
+module.exports = { DEFAULTS, MAX_TEXT, MAX_IMAGE_BYTES, MAX_IMAGES, imageIds, imageNames, validateSettings, validateQuestion, inspectImage, clampBounds, boundedContext, diskHistory, validateHistory };

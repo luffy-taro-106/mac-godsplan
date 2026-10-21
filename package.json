@@ -1,6 +1,6 @@
 {
   "name": "opencluely-overlay",
-  "version": "2.3.0",
+  "version": "2.3.5",
   "description": "Persistent desktop overlay for text and image questions with OpenAI, Claude and Gemini",
   "main": "overlay/main.js",
   "author": "OpenCluely contributors",
@@ -15,8 +15,9 @@
   "scripts": {
     "start": "node scripts/launch.js",
     "dev": "node scripts/launch.js",
-    "test": "node --test tests/core.test.js tests/providers.test.js tests/storage.test.js tests/platform.test.js tests/quit-guard.test.js tests/recovery.test.js",
+    "test": "node --test tests/core.test.js tests/providers.test.js tests/storage.test.js tests/platform.test.js tests/quit-guard.test.js tests/recovery.test.js tests/interrupted-work.test.js",
     "test:desktop": "node scripts/launch.js --smoke-test",
+    "test:interruption": "node scripts/test-interruption.js",
     "test:recovery": "node --test --test-concurrency=1 tests/recovery-native.test.js tests/recovery-launchd.test.js",
     "icons": "node scripts/create-icons.js",
     "postinstall": "node scripts/create-icons.js",
