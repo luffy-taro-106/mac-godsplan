@@ -37,7 +37,7 @@
       <button class="icon-button" id="settingsButton" title="Settings" aria-label="Open settings"><svg><use href="#settings"/></svg></button>
     </div>
   </div>
-  <div class="model-strip"><select id="quickModel" aria-label="Model for the selected provider"></select><button id="newChatButton" type="button" class="new-chat-button">＋ New chat</button></div>
+  <div class="model-strip"><select id="quickModel" aria-label="Model for the selected provider"></select><select id="quickEffort" aria-label="Reasoning effort" title="Reasoning effort"></select><button id="newChatButton" type="button" class="new-chat-button">＋ New chat</button></div>
   <div class="mode-banner" id="passBanner" hidden>Clicks pass to the app underneath <kbd data-shortcut="Click-through">Ctrl+Alt+I</kbd> to interact</div>
   <section class="content" id="content" aria-label="Conversation">
     <div class="welcome" id="welcome">
@@ -61,8 +61,10 @@
   <div class="dialog-heading"><h2>Settings</h2><button class="icon-button" id="closeSettings" aria-label="Close settings"><svg><use href="#close"/></svg></button></div>
   <form id="settingsForm">
     <label>AI provider<select id="settingsProvider"><option value="anthropic">Anthropic Claude</option><option value="gemini">Google Gemini</option><option value="openai">OpenAI / ChatGPT</option></select></label>
-    <label>Model<select id="modelPreset"></select><small>Text and image models. Availability and cost depend on your API account.</small></label>
+    <label>Model<select id="modelPreset"></select><small>Available chat models from your API account. Text-only models are marked.</small></label>
+    <div class="catalog-controls"><small id="modelStatus" role="status"></small><button type="button" id="refreshModels" class="text-button">Refresh models / check key</button></div>
     <label id="customModelLabel" hidden>Custom model ID<input id="model" maxlength="100" spellcheck="false" autocomplete="off"><small>Enter an API model ID with text and image support.</small></label>
+    <label>Reasoning effort<select id="reasoningEffort" aria-describedby="reasoningHint"></select><small id="reasoningHint">Higher effort can take longer and cost more. Saved separately for each model.</small></label>
     <p id="openaiNote" class="privacy-note" hidden>Uses an OpenAI API key and separate API billing. A ChatGPT subscription alone does not provide an API key.</p>
     <label>API key <span id="keyBadge" class="key-badge"></span><input id="apiKey" type="password" maxlength="500" autocomplete="off" spellcheck="false" placeholder="Paste your key"><small id="keyNote">Saved encrypted on this device, including after restart. A new key is verified before replacing your saved key. Leave blank to keep it.</small></label>
     <button type="button" id="removeKey" class="text-button danger" hidden>Remove saved key</button>

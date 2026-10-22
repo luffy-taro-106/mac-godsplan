@@ -6,17 +6,18 @@ const MAX_IMAGES = 10;
 const MAX_CONTEXT_IMAGES = 10;
 const imageIds = value => Array.isArray(value?.imageIds) ? value.imageIds : value?.imageId ? [value.imageId] : [];
 const imageNames = value => Array.isArray(value?.imageNames) ? value.imageNames : value?.imageName ? [value.imageName] : [];
-const { PROVIDERS } = require('./models');
+const { PROVIDERS, EFFORTS, validModelId } = require('./models');
 const DEFAULTS = Object.freeze({
   provider: 'anthropic',
   models: { anthropic: 'claude-sonnet-5-5', gemini: 'gemini-3.8-flash', openai: 'gpt-6.1-sol' },
+  reasoningEfforts: {},
   opacity: 0.98, codeOpacity: 1, launchAtLogin: false, rememberHistory: true, hideFromCapture: true, protectFromQuit: true,
   bounds: null, compact: false
 });
 
 function validateSettings(input, current = DEFAULTS) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid settings.');
-  const next = { ...DEFAULTS, ...current, models: { ...DEFAULTS.models, ...current.models } };
+  const next = { ...DEFAULTS, ...current, models: { ...DEFAULTS.models, ...current.models }, reasoningEfforts: { ...current.reasoningEfforts } };
   if ('provider' in input) {
     if (!PROVIDERS.includes(input.provider)) throw new Error('Choose Claude, Gemini, or OpenAI / ChatGPT.');
     next.provider = input.provider;
@@ -27,7 +28,18 @@ function validateSettings(input, current = DEFAULTS) {
       if (typeof model !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,99}$/.test(model)) throw new Error('Enter a valid model ID.');
       next.models[provider] = model;
     }
+    if (input.reasoningEfforts && provider in input.reasoningEfforts) {
+      const choices = input.reasoningEfforts[provider];
+      if (!choices || typeof choices !== 'object' || Array.isArray(choices) || Object.keys(choices).length > 500) throw new Error('Invalid reasoning preferences.');
+      next.reasoningEfforts[provider] = { ...next.reasoningEfforts[provider] };
+      for (const [id, effort] of Object.entries(choices)) {
+        if (!validModelId(id) || !EFFORTS.includes(effort)) throw new Error('Choose a valid reasoning effort.');
+        next.reasoningEfforts[provider][id] = effort;
+      }
+      if (Object.keys(next.reasoningEfforts[provider]).length > 500) throw new Error('Too many reasoning preferences.');
+    }
   }
+  if ('reasoningEfforts' in input && (!input.reasoningEfforts || typeof input.reasoningEfforts !== 'object' || Array.isArray(input.reasoningEfforts) || Object.keys(input.reasoningEfforts).some(provider => !PROVIDERS.includes(provider)))) throw new Error('Invalid reasoning preferences.');
   if ('opacity' in input) {
     if (!Number.isFinite(input.opacity) || input.opacity < 0.1 || input.opacity > 1) throw new Error('Opacity must be between 10% and 100%.');
     next.opacity = input.opacity;

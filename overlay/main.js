@@ -7,12 +7,12 @@ const os = require('node:os');
 const { randomUUID } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const { DEFAULTS, MAX_IMAGE_BYTES, MAX_IMAGES, imageIds, imageNames, validateSettings, validateQuestion, inspectImage, clampBounds, boundedContext, diskHistory, validateHistory } = require('./core');
-const { streamAnswer, validateApiKey } = require('./providers');
+const { streamAnswer, validateApiKey, listProviderModels } = require('./providers');
 const { Store } = require('./storage');
 const { InterruptedWork } = require('./interrupted-work');
 const { QuitGuard } = require('./quit-guard');
 const { MacRecovery, recoverySession } = require('./recovery');
-const { MODEL_CATALOG, PROVIDERS, PROVIDER_NAMES } = require('./models');
+const { MODEL_CATALOG, PROVIDERS, PROVIDER_NAMES, EFFORTS, validModelId, modelDetails } = require('./models');
 const { platformInfo, shortcutLabel, loginOptions, startHidden, startupAvailable } = require('./platform');
 const platform = platformInfo();
 
@@ -41,6 +41,8 @@ const html = path.join(__dirname, 'ui', 'index.html');
 const pageURL = pathToFileURL(html).href;
 let answerFunction = streamAnswer;
 let keyValidator = validateApiKey;
+let modelLister = listProviderModels;
+const modelCatalog = structuredClone(MODEL_CATALOG), modelStatus = {}, modelRefreshes = new Map();
 let screenPermissionFunction = () => platform.mac ? systemPreferences.getMediaAccessStatus('screen') : 'granted';
 let quitConfirmationFunction = async () => {
   showOverlay(true);
@@ -95,7 +97,7 @@ function currentState() {
     maxImages: MAX_IMAGES,
     draftImages: [...draftImageIds].map(id => images.get(id)).filter(Boolean).map(publicImage),
     keyStatus: Object.fromEntries(PROVIDERS.map(provider => [provider, !!keys[provider]])),
-    modelCatalog: MODEL_CATALOG,
+    modelCatalog, modelStatus,
     archivedChats: archivedChats.map(({ id, title, updatedAt }) => ({ id, title, updatedAt })),
     secureStorage: store.available(), warnings, shortcuts, platform,
     captureProtectionActive: !!win && !win.isDestroyed() && win.isContentProtected(),
@@ -106,6 +108,54 @@ function currentState() {
   };
 }
 function syncState() { emit({ type: 'state', value: currentState() }); updateTray(); }
+
+function persistModelCatalog() {
+  try {
+    store.write('model-catalog.json', Object.fromEntries(PROVIDERS.filter(provider => keys[provider] && modelStatus[provider]?.checkedAt)
+      .map(provider => [provider, { models: modelCatalog[provider], total: modelStatus[provider].total, checkedAt: modelStatus[provider].checkedAt }])));
+  } catch { warn('The refreshed model list could not be cached. It is available until you quit.'); }
+}
+function restoreModelCatalog() {
+  const cached = store.read('model-catalog.json', {});
+  for (const provider of PROVIDERS) {
+    const entry = cached?.[provider];
+    if (!keys[provider] || !entry || !Array.isArray(entry.models) || entry.models.length > 1000 || !Number.isFinite(entry.total) || !Number.isFinite(Date.parse(entry.checkedAt))) continue;
+    if (!entry.models.every(model => model && validModelId(model.id) && typeof model.name === 'string' && model.name.length <= 250 &&
+      Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.every(value => EFFORTS.includes(value) && value !== 'auto') &&
+      [null, 'effort', 'thinkingLevel', 'thinkingBudget'].includes(model.reasoningMode) && [null, 'adaptive', 'enabled'].includes(model.thinking) && typeof model.vision === 'boolean')) continue;
+    modelCatalog[provider] = entry.models;
+    modelStatus[provider] = { source: 'cached', total: entry.total, checkedAt: entry.checkedAt, refreshing: false, error: '' };
+  }
+}
+async function refreshModels(provider = null) {
+  if (provider !== null && !PROVIDERS.includes(provider)) throw new Error('Choose a valid AI provider.');
+  await Promise.all((provider ? [provider] : PROVIDERS).map(async selected => {
+    const apiKey = keys[selected];
+    if (!apiKey) return;
+    if (modelRefreshes.get(selected)?.apiKey === apiKey) return modelRefreshes.get(selected).promise;
+    const task = { apiKey };
+    modelStatus[selected] = { ...modelStatus[selected], refreshing: true, error: '' };
+    task.promise = (async () => {
+      try {
+        const result = await modelLister(selected, apiKey);
+        if (keys[selected] !== apiKey) return;
+        modelCatalog[selected] = result.models;
+        modelStatus[selected] = { source: 'live', total: result.total, checkedAt: result.checkedAt, refreshing: false, error: '' };
+        persistModelCatalog();
+      } catch (error) {
+        if (keys[selected] !== apiKey) return;
+        modelStatus[selected] = { ...modelStatus[selected], refreshing: false, error: error.message };
+      } finally {
+        if (modelRefreshes.get(selected) === task) modelRefreshes.delete(selected);
+        if (!quitting) syncState();
+      }
+    })();
+    modelRefreshes.set(selected, task);
+    syncState();
+    return task.promise;
+  }));
+  return currentState();
+}
 async function setRecoveryEnabled(enabled) {
   if (typeof enabled !== 'boolean') throw new Error('Choose whether automatic reopening is on or off.');
   if (!recovery?.available) throw new Error('Automatic reopening is available in the installed Mac app.');
@@ -344,6 +394,10 @@ async function ask(input) {
   if (!apiKey) throw new Error(`Add your ${PROVIDER_NAMES[provider]} API key in Settings first.`);
   const attachments = question.imageIds.map(id => images.get(id));
   if (attachments.some(image => !image)) throw new Error('An attachment expired. Please attach the missing image again.');
+  const modelInfo = modelCatalog[provider].find(item => item.id === model) || modelDetails(provider, model);
+  if (!modelInfo.vision && attachments.length) throw new Error('This model accepts text only. Select a vision model for images.');
+  const savedEffort = settings.reasoningEfforts[provider]?.[model] || 'auto';
+  const reasoningEffort = modelInfo.reasoningEfforts.includes(savedEffort) ? savedEffort : 'auto';
   const request = { id: randomUUID(), question, images: attachments, provider, model, text: '', controller: new AbortController() };
   active = request; lastAttempt = null;
   interruptedWork.start(request, history);
@@ -352,7 +406,7 @@ async function ask(input) {
   // Returning immediately lets the UI cancel while the stream is running.
   void (async () => {
     try {
-      const answer = await answerFunction({ provider, model, apiKey, messages: boundedContext(history, question, id => images.get(id)), signal: request.controller.signal,
+      const answer = await answerFunction({ provider, model, apiKey, reasoningEffort, modelInfo, messages: boundedContext(history, question, id => images.get(id)), signal: request.controller.signal,
         onDelta: delta => { request.text += delta; interruptedWork.update(request, history); emit({ type: 'delta', id: request.id, text: delta }); },
         onStatus: text => emit({ type: 'status', id: request.id, text }) });
       request.controller.signal.throwIfAborted();
@@ -383,6 +437,12 @@ async function saveSettings(input) {
   settingsBusy = true;
   try {
     const next = validateSettings(input, settings);
+    for (const [provider, choices] of Object.entries(input.reasoningEfforts || {})) {
+      for (const [model, effort] of Object.entries(choices)) {
+        const info = modelCatalog[provider].find(item => item.id === model) || modelDetails(provider, model);
+        if (effort !== 'auto' && !info.reasoningEfforts.includes(effort)) throw new Error('This model does not support the selected reasoning effort.');
+      }
+    }
     if (next.rememberHistory && !store.available()) throw new Error('Secure storage is unavailable. Turn off conversation history to save preferences.');
     const nextKeys = { ...keys };
     let replacementKey = '';
@@ -422,6 +482,12 @@ async function saveSettings(input) {
       throw error;
     }
     settings = next; keys = nextKeys;
+    if (credentialsChanged) {
+      modelCatalog[next.provider] = structuredClone(MODEL_CATALOG[next.provider]);
+      delete modelStatus[next.provider];
+      persistModelCatalog();
+      if (replacementKey && !testMode) void refreshModels(next.provider);
+    }
     if (settings.rememberHistory && lastAttempt) interruptedWork.start(lastAttempt, history);
     applyWindowMode(); persistHistory(); syncState();
     return currentState();
@@ -481,6 +547,7 @@ function registerIPC() {
   handle('import-image', importImage); handle('capture', capture);
   handle('release-image', id => { draftImageIds.delete(id); if (typeof id === 'string' && !history.some(message => imageIds(message).includes(id)) && !imageIds(active?.question).includes(id) && !imageIds(lastAttempt?.question).includes(id)) images.delete(id); return true; });
   handle('save-settings', saveSettings);
+  handle('refresh-models', refreshModels);
   handle('screen-settings', openScreenSettings);
   handle('set-recovery-enabled', setRecoveryEnabled);
   handle('new-chat', () => changeConversation());
@@ -561,6 +628,7 @@ async function initialize() {
   if (!store.available()) { settings.rememberHistory = false; warn('Secure storage is unavailable. API keys and history cannot be saved.'); }
   const credentials = store.read('credentials.enc', {}, true);
   for (const provider of PROVIDERS) if (typeof credentials?.[provider] === 'string' && credentials[provider].length <= 500) keys[provider] = credentials[provider];
+  restoreModelCatalog();
   if (settings.rememberHistory) {
     try { history = validateHistory(store.read('conversation.enc', [], true)); }
     catch { warn('Saved conversation could not be restored.'); }
@@ -600,8 +668,10 @@ async function initialize() {
   }
   initializationComplete = true;
   log('app-ready');
+  if (!testMode) void refreshModels();
   if (testMode) {
-    await require(interruptionTestMode ? '../tests/interruption-electron' : quitTestMode ? '../tests/quit-electron' : '../tests/smoke-electron').run({ app, getWindow: () => win, store, currentState, ask, saveSettings, importImage, capture, images, showOverlay, hideOverlay, togglePassThrough, toggleCompact, requestQuit, setRecoveryEnabled, changeConversation,
+    await require(interruptionTestMode ? '../tests/interruption-electron' : quitTestMode ? '../tests/quit-electron' : '../tests/smoke-electron').run({ app, getWindow: () => win, store, currentState, ask, saveSettings, refreshModels, importImage, capture, images, showOverlay, hideOverlay, togglePassThrough, toggleCompact, requestQuit, setRecoveryEnabled, changeConversation,
+      setModelLister: fn => { modelLister = fn; },
       setQuitConfirmationFunction: fn => { quitConfirmationFunction = fn; },
       setRecoveryController: controller => { const previous = recovery; recovery = controller; syncState(); return previous; },
       setAnswerFunction: fn => { answerFunction = fn; }, setKeyValidator: fn => { keyValidator = fn; }, setScreenPermissionFunction: fn => { screenPermissionFunction = fn; }, cancel: () => active?.controller.abort(), clear: () => { history = []; images.clear(); lastAttempt = null; persistHistory(); syncState(); },

@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld('overlay', {
   capture: displayId => invoke('capture', displayId),
   releaseImage: id => invoke('release-image', id),
   saveSettings: settings => invoke('save-settings', settings),
+  refreshModels: provider => invoke('refresh-models', provider),
   setRecoveryEnabled: enabled => invoke('set-recovery-enabled', enabled),
   openScreenSettings: () => invoke('screen-settings'),
   clear: () => invoke('clear'),

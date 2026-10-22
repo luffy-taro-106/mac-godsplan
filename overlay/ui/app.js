@@ -138,6 +138,7 @@ function updateControls() {
   $('sendButton').disabled = busy || importing || !(question.value.trim() || attachments.length);
   $('provider').disabled = busy;
   $('quickModel').disabled = busy;
+  $('quickEffort').disabled = busy || !$('quickEffort').options.length || $('quickEffort').options.length === 1;
   $('newChatButton').disabled = busy || importing || !!state?.captureBusy;
   $('newChatButton').title = busy ? 'Stop the answer before starting a new chat' : 'Save this conversation and start a new one';
   $('openChatButton').disabled = busy || !$('chatSelect').value;
@@ -191,6 +192,8 @@ function applyState(value) {
   $('passButton').setAttribute('aria-pressed', String(state.passThrough));
   $('provider').value = state.settings.provider;
   fillModelOptions($('quickModel'), state.settings.provider, models[state.settings.provider]);
+  fillEffortOptions($('quickEffort'), state.settings.provider, models[state.settings.provider]);
+  if ($('settingsDialog').open) renderCatalogStatus();
   const selectedChat = $('chatSelect').value;
   $('chatSelect').replaceChildren(new Option('Choose a previous chat…', ''));
   for (const chat of state.archivedChats || []) $('chatSelect').append(new Option(chat.title, chat.id));
@@ -264,6 +267,43 @@ function populateKeyFields() {
   $('apiKey').placeholder = state?.keyStatus[provider] ? 'Leave blank to keep your saved key' : 'Paste your API key';
   $('keyBadge').textContent = state?.keyStatus[provider] ? 'Key saved' : 'No key yet';
   $('removeKey').hidden = !state?.keyStatus[provider];
+  renderCatalogStatus();
+}
+const effortLabels = { auto: 'Auto', none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max' };
+function selectedModelInfo(provider, model) { return state?.modelCatalog?.[provider]?.find(item => item.id === model); }
+function fillEffortOptions(select, provider, model, current = state?.settings.reasoningEfforts?.[provider]?.[model] || 'auto') {
+  const levels = selectedModelInfo(provider, model)?.reasoningEfforts || [];
+  const quick = select.id === 'quickEffort';
+  select.replaceChildren(new Option(quick ? 'Effort: Auto' : levels.length ? 'Auto · provider default' : 'Auto · no adjustable effort', 'auto'),
+    ...levels.map(value => new Option(`${quick ? 'Effort: ' : ''}${effortLabels[value] || value}`, value)));
+  select.value = levels.includes(current) ? current : 'auto';
+  select.disabled = !levels.length || (quick && (sending || !!state?.busy));
+  if (!quick) {
+    const info = selectedModelInfo(provider, model);
+    $('reasoningHint').textContent = !levels.length ? 'This model has no verified adjustable effort options. Auto uses its default behavior.'
+      : info.reasoningMode === 'thinkingBudget' ? 'Low / Medium / High use thinking token budgets. Higher effort can take longer and cost more.'
+        : 'Higher effort can take longer and cost more. Saved separately for each model.';
+  }
+}
+let settingsCatalogSignature = '';
+function renderCatalogStatus() {
+  const provider = $('settingsProvider').value, status = state?.modelStatus?.[provider];
+  const count = state?.modelCatalog?.[provider]?.length || 0;
+  $('refreshModels').disabled = !state?.keyStatus[provider] || !!status?.refreshing;
+  $('keyBadge').textContent = !state?.keyStatus[provider] ? 'No key yet' : status?.source === 'live' && !status.error ? 'API access verified' : 'Key saved';
+  const checked = status?.checkedAt ? new Date(status.checkedAt).toLocaleString() : '';
+  $('modelStatus').textContent = status?.refreshing ? 'Checking API access and refreshing models…'
+    : status?.error ? `${status.error} Previous models remain available.`
+      : status?.checkedAt ? `${count} chat models · ${status.total} total API models. ${status.source === 'cached' ? 'Cached' : 'Verified'} ${checked}.`
+        : 'Save a key to load its available models. The starting list is shown until refreshed.';
+  const signature = `${provider}/${status?.checkedAt}/${status?.source}`;
+  if (settingsCatalogSignature !== signature) {
+    settingsCatalogSignature = signature;
+    const current = $('model').value || models[provider], effort = $('reasoningEffort').value;
+    fillModelOptions($('modelPreset'), provider, current, true);
+    updateCustomModel();
+    fillEffortOptions($('reasoningEffort'), provider, current, effort || undefined);
+  }
 }
 function fillModelOptions(select, provider, current, settingsMenu = false) {
   const options = (state?.modelCatalog?.[provider] || []).map(model => new Option(model.name, model.id));
@@ -278,6 +318,7 @@ function updateCustomModel() {
   $('customModelLabel').hidden = !custom;
   $('model').required = custom;
   if (!custom) $('model').value = $('modelPreset').value;
+  fillEffortOptions($('reasoningEffort'), $('settingsProvider').value, $('model').value);
 }
 async function resetComposer() {
   question.value = ''; sessionStorage.removeItem('draft'); await setAttachments([]); resizeQuestion();
@@ -343,6 +384,11 @@ $('compactButton').addEventListener('click', guard(() => call('compact')));
 $('passButton').addEventListener('click', guard(() => call('passThrough')));
 $('stopButton').addEventListener('click', guard(async () => { await call('cancel'); $('statusText').textContent = 'Stopping…'; }));
 $('provider').addEventListener('change', guard(async () => { try { applyState(await call('saveSettings', { provider: $('provider').value })); } finally { $('provider').value = state.settings.provider; } }));
+$('quickEffort').addEventListener('change', guard(async () => {
+  const provider = state.settings.provider, model = models[provider];
+  try { applyState(await call('saveSettings', { reasoningEfforts: { [provider]: { [model]: $('quickEffort').value } } })); }
+  finally { fillEffortOptions($('quickEffort'), provider, model); }
+}));
 $('quickModel').addEventListener('change', guard(async () => {
   try { applyState(await call('saveSettings', { models: { [state.settings.provider]: $('quickModel').value } })); }
   finally { fillModelOptions($('quickModel'), state.settings.provider, models[state.settings.provider]); }
@@ -363,6 +409,11 @@ $('closeSettings').addEventListener('click', () => { $('apiKey').value = ''; $('
 $('settingsDialog').addEventListener('close', () => { $('apiKey').value = ''; });
 $('settingsProvider').addEventListener('change', populateKeyFields);
 $('modelPreset').addEventListener('change', updateCustomModel);
+$('model').addEventListener('input', updateCustomModel);
+$('refreshModels').addEventListener('click', guard(async () => {
+  applyState(await call('refreshModels', $('settingsProvider').value));
+  renderCatalogStatus();
+}));
 $('opacity').addEventListener('input', () => { $('opacityValue').textContent = `${$('opacity').value}%`; });
 $('codeOpacity').addEventListener('input', () => { $('codeOpacityValue').textContent = `${$('codeOpacity').value}%`; });
 $('recoveryEnabled').addEventListener('change', async () => {
@@ -383,7 +434,8 @@ $('settingsForm').addEventListener('submit', async event => {
   const controls = [...$('settingsForm').querySelectorAll('input, select, button')].map(control => [control, control.disabled]);
   try {
     const provider = $('settingsProvider').value;
-    const input = { provider, models: { [provider]: $('model').value.trim() }, opacity: Number($('opacity').value) / 100, codeOpacity: Number($('codeOpacity').value) / 100, launchAtLogin: $('launchAtLogin').checked, rememberHistory: $('rememberHistory').checked, hideFromCapture: $('hideFromCapture').checked, protectFromQuit: $('protectFromQuit').checked };
+    const model = $('model').value.trim();
+    const input = { provider, models: { [provider]: model }, reasoningEfforts: { [provider]: { [model]: $('reasoningEffort').value } }, opacity: Number($('opacity').value) / 100, codeOpacity: Number($('codeOpacity').value) / 100, launchAtLogin: $('launchAtLogin').checked, rememberHistory: $('rememberHistory').checked, hideFromCapture: $('hideFromCapture').checked, protectFromQuit: $('protectFromQuit').checked };
     if ($('apiKey').value.trim()) input.apiKey = $('apiKey').value.trim();
     controls.forEach(([control]) => { control.disabled = true; });
     $('saveButton').textContent = input.apiKey ? 'Verifying and saving key…' : 'Saving…';
