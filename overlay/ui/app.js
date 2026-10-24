@@ -12,6 +12,7 @@ const content = $('content');
 let selectedDisplay = sessionStorage.getItem('display') || '';
 let recoveryRequested = null, recoveryActionError = '';
 let backdropFrame = 0;
+function focusQuestion() { if (!document.querySelector('dialog[open]') && !state?.settings.compact) question.focus(); }
 
 // The app background has holes behind visible code boxes. Otherwise an opaque
 // app background would impose a minimum opacity on a translucent code box.
@@ -110,7 +111,7 @@ function showFailure(view, attempt) {
   retry.addEventListener('click', guard(() => {
     if (!attempt.needsAttachment) return submit(attempt.question);
     question.value = attempt.question.text; sessionStorage.setItem('draft', question.value);
-    resizeQuestion(); updateControls(); question.focus();
+    resizeQuestion(); updateControls(); focusQuestion();
     notify('Attach the original images again, then send the question.');
   })); view.card.append(retry);
   if (attempt.text) addCopy(view.card, attempt.text);
@@ -240,7 +241,7 @@ async function loadAttachments(action) {
     const result = await action(MAX_IMAGES - attachments.length);
     added = (Array.isArray(result) ? result : result ? [result] : []).filter(image => !attachments.some(item => item.id === image.id));
     if (added.length + attachments.length > MAX_IMAGES) throw new Error(`Attach up to ${MAX_IMAGES} images per question.`);
-    if (added.length) { await setAttachments([...attachments, ...added]); question.focus(); }
+    if (added.length) { await setAttachments([...attachments, ...added]); focusQuestion(); }
   } catch (error) {
     for (const image of added) void call('releaseImage', image.id).catch(() => {});
     throw error;
@@ -322,7 +323,7 @@ function updateCustomModel() {
 }
 async function resetComposer() {
   question.value = ''; sessionStorage.removeItem('draft'); await setAttachments([]); resizeQuestion();
-  autoScroll = true; $('settingsDialog').close(); question.focus();
+  autoScroll = true; $('settingsDialog').close(); focusQuestion();
 }
 function openSettings() {
   if (!state) return;
@@ -370,7 +371,7 @@ api.onEvent(event => {
   }
   else if (event.type === 'notice') notify(event.text);
   else if (event.type === 'open-settings') openSettings();
-  else if (event.type === 'focus-input') { if (!state?.settings.compact) question.focus(); }
+  else if (event.type === 'focus-input') focusQuestion();
 });
 
 $('questionForm').addEventListener('submit', guard(async event => { event.preventDefault(); await submit(); }));

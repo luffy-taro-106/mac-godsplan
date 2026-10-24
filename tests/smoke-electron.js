@@ -55,11 +55,95 @@ exports.run = async runtime => {
       await until(() => win.isFocused());
       runtime.togglePassThrough(); assert.equal(runtime.currentState().passThrough,true); assert.equal(win.isFocusable(),false);
       if (process.platform === 'darwin') assert.equal(win.isFocused(), false, 'Click-through must release keyboard focus on macOS');
-      runtime.togglePassThrough(); assert.equal(win.isFocusable(),true);
+      runtime.togglePassThrough(); assert.equal(win.isFocusable(),true, 'Leaving click-through must restore keyboard input');
       const height = win.getBounds().height;
       runtime.toggleCompact(); assert.ok(Math.abs(win.getBounds().height - 122) <= 2, 'Native border may add two pixels');
       runtime.toggleCompact(); assert.equal(win.getBounds().height,height);
       runtime.hideOverlay();
+    });
+    if (process.platform === 'darwin') await test('Mac nonactivating panel stays editable without manual input modes', async () => {
+      // This fixture verifies showInactive and editing within Electron. It does
+      // not establish how a separate browser handles physical panel clicks.
+      const page = new BrowserWindow({ show: false, width: 500, height: 350, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+      const pageState = () => page.webContents.executeJavaScript('({ focused: document.hasFocus(), blurs: window.blurs })');
+      const focusPage = async () => {
+        page.show(); page.focus(); page.webContents.focus();
+        await until(async () => page.isFocused() && (await pageState()).focused);
+      };
+      try {
+        await page.loadURL(`data:text/html,${encodeURIComponent('<!doctype html><title>Focus fixture</title><p>Keep this page focused</p><script>window.blurs = 0; window.addEventListener("blur", () => window.blurs++);</script>')}`);
+        assert.equal(typeof runtime.setInputMode, 'undefined');
+        assert.equal(Object.hasOwn(runtime.currentState(), 'inputMode'), false);
+        assert.deepEqual(await js('[typeof window.overlay.setInputMode, !!document.getElementById("inputModeControl"), !!document.getElementById("inputModeButton"), !!document.getElementById("inputModeStatus")]'), ['undefined', false, false, false]);
+        await focusPage();
+        const before = await pageState();
+        runtime.showOverlay(false);
+        await delay(100);
+        assert.equal(runtime.currentState().passThrough, false);
+        assert.equal(win.isFocusable(), true, 'The panel must always allow ordinary keyboard input');
+        assert.deepEqual(await js('[document.getElementById("question").readOnly, document.getElementById("provider").disabled, document.getElementById("quickModel").disabled]'), [false, false, false]);
+        assert.deepEqual(await pageState(), before, 'Showing the panel without focus must preserve the focused fixture');
+        const panel = runtime.currentState().panelBehavior;
+        assert.equal(panel.available, true, 'Native panel configuration must be available on macOS');
+        assert.equal(panel.preventsActivation, true, 'The native panel must prevent application activation');
+        assert.equal(panel.nonactivatingStyle, true);
+        assert.equal(panel.focusable, true);
+
+        win.focus(); win.webContents.focus();
+        await until(() => win.isFocused());
+        await js('document.getElementById("question").focus()');
+        const draft = 'Typing without a mode switch';
+        for (const character of draft) win.webContents.sendInputEvent({ type: 'char', keyCode: character });
+        await until(async () => await js('document.getElementById("question").value') === draft);
+        await focusPage();
+        await delay(100);
+        assert.equal(win.isFocusable(), true, 'Returning to another window must not disable the composer');
+        assert.deepEqual(await js('[document.getElementById("question").readOnly, document.getElementById("provider").disabled, document.getElementById("quickModel").disabled]'), [false, false, false]);
+        assert.equal(await js('document.getElementById("question").value'), draft);
+
+        const compact = runtime.currentState().settings.compact;
+        runtime.toggleCompact();
+        assert.equal(runtime.currentState().settings.compact, !compact);
+        runtime.toggleCompact();
+        assert.equal(runtime.currentState().settings.compact, compact);
+        assert.equal(win.isFocusable(), true);
+        runtime.togglePassThrough();
+        assert.equal(win.isFocusable(), false);
+        runtime.togglePassThrough();
+        assert.equal(win.isFocusable(), true, 'Click-through round trip must restore editing automatically');
+        assert.equal(runtime.currentState().panelBehavior.preventsActivation, true);
+        await focusPage();
+        const beforeReshow = await pageState();
+        runtime.hideOverlay(); runtime.showOverlay(false);
+        await delay(100);
+        assert.deepEqual(await pageState(), beforeReshow, 'Showing again must not activate or focus the panel');
+
+        win.focus(); win.webContents.focus();
+        await until(() => win.isFocused());
+        await js('document.getElementById("settingsButton").click()');
+        await until(async () => await js('document.getElementById("settingsDialog").open'));
+        assert.equal(await js('document.getElementById("apiKey").disabled || document.getElementById("apiKey").readOnly || document.getElementById("settingsProvider").disabled'), false);
+        await js('document.getElementById("apiKey").focus()');
+        win.webContents.sendInputEvent({ type: 'char', keyCode: 'x' });
+        await until(async () => await js('document.getElementById("apiKey").value === "x"'));
+        await focusPage();
+        assert.equal(await js('document.getElementById("settingsDialog").open'), true);
+        assert.equal(win.isFocusable(), true, 'Settings must remain editable after temporary focus changes');
+        win.focus(); win.webContents.focus();
+        await js('document.getElementById("clearButton").click()');
+        await until(async () => await js('document.getElementById("clearDialog").open'));
+        await js('document.getElementById("cancelClear").click()');
+        assert.equal(await js('document.getElementById("settingsDialog").open && !document.getElementById("clearDialog").open'), true);
+        await js('document.getElementById("closeSettings").click()');
+        assert.equal(await js('document.getElementById("settingsDialog").open'), false);
+        assert.equal(await js('document.getElementById("apiKey").value'), '');
+        assert.equal(win.isFocusable(), true, 'Closing Settings must keep the composer editable');
+        assert.equal(win.isVisible(), true);
+        assert.equal(win.isAlwaysOnTop(), true);
+      } finally {
+        await js('document.querySelectorAll("dialog[open]").forEach(dialog => dialog.close()); document.getElementById("question").value = ""; document.getElementById("question").dispatchEvent(new Event("input")); document.getElementById("apiKey").value = ""');
+        runtime.hideOverlay(); page.destroy();
+      }
     });
     if (process.platform === 'win32') await test('capture protection excludes a visible overlay from native screen capture', async () => {
       assert.equal(win.isContentProtected(), true); assert.equal(runtime.currentState().captureProtectionActive, true);
@@ -157,6 +241,8 @@ exports.run = async runtime => {
       await until(async()=>await js('!document.getElementById("attachment").hidden'));
       await js('document.getElementById("question").value="Read and answer the question in this image";document.getElementById("question").dispatchEvent(new Event("input"));document.getElementById("questionForm").dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}))');
       await until(()=>runtime.getHistory().length===2 && !runtime.currentState().busy);
+      assert.equal(win.isFocusable(), true, 'Sending a question must leave the composer editable');
+      assert.equal(await js('document.getElementById("question").readOnly'), false);
       assert.equal(received.messages.at(-1).image.mime,'image/jpeg'); assert.ok(received.messages.at(-1).image.data.length>100);
       await until(async()=>await js('document.getElementById("attachment").hidden'));
       await until(async()=>await js('document.querySelectorAll(".message").length===2'));
@@ -264,6 +350,9 @@ exports.run = async runtime => {
       await until(async()=>{try{return await js('document.querySelectorAll(".message").length>=4');}catch{return false;}},12000);
       assert.equal(runtime.getHistory().length,4); assert.equal(win.isAlwaysOnTop(),true); assert.equal(win.isContentProtected(),true);
       assert.equal(await js('document.getElementById("provider").value'),'anthropic');
+      assert.equal(win.isFocusable(), true, 'Renderer recovery must preserve keyboard input');
+      assert.equal(await js('document.getElementById("question").readOnly'), false);
+      if (process.platform === 'darwin') assert.equal(runtime.currentState().panelBehavior.preventsActivation, true);
     });
     await test('renderer crash preserves an active provider request and its encrypted checkpoint', async () => {
       let pendingSignal;

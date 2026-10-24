@@ -31,6 +31,7 @@ if (process.platform === 'win32') app.setAppUserModelId('com.opencluely.overlay'
 
 let win, tray, store, quitting = false, settings, keys = {}, history = [], active = null, lastAttempt = null;
 let passThrough = false, captureBusy = false, settingsBusy = false, geometryTimer, normalBounds;
+let panelNative = null, panelBehavior = { available: false, preventsActivation: false };
 let screenshotRestore = true;
 let launchHidden = false;
 let recovery, interruptedWork, initializationComplete = false;
@@ -91,7 +92,7 @@ function canStartAtLogin() {
 function screenPermission() { return screenPermissionFunction(); }
 function currentState() {
   return {
-    settings, history: diskHistory(history), passThrough, busy: !!active, captureBusy,
+    settings, history: diskHistory(history), passThrough, panelBehavior, busy: !!active, captureBusy,
     active: active ? { id: active.id, question: active.question, text: active.text, images: active.images.map(publicImage), provider: active.provider, model: active.model } : null,
     lastAttempt: lastAttempt ? { ...lastAttempt, images: imageIds(lastAttempt.question).map(id => images.get(id)).filter(Boolean).map(publicImage) } : null,
     maxImages: MAX_IMAGES,
@@ -164,7 +165,7 @@ async function setRecoveryEnabled(enabled) {
 }
 function manualReopen() {
   if (!settings || quitting) return;
-  showOverlay(true);
+  showOverlay(!platform.mac);
   if (initializationComplete && recovery?.available && !recovery.enabled && !recovery.busy) {
     void recovery.enable().catch(() => {});
   }
@@ -219,24 +220,35 @@ function applyWindowMode() {
   // Renderer layers control opacity so code boxes never inherit the app fade.
   win.setOpacity(1);
   win.setIgnoreMouseEvents(passThrough, { forward: true });
-  if (passThrough && platform.mac && win.isFocused()) win.blur();
-  win.setFocusable(!passThrough);
+  const focusable = !passThrough;
+  // Disabling focus alone does not release an existing key window on macOS.
+  if (!focusable && platform.mac && win.isFocused()) win.blur();
+  win.setFocusable(focusable);
+  if (panelNative) {
+    try { panelBehavior = panelNative.configure(win.getNativeWindowHandle()); }
+    catch { warn('Native panel support could not be applied. Other apps may lose focus when using this overlay.'); }
+  }
 }
 function showOverlay(focus = false) {
   if (!win || win.isDestroyed()) createWindow();
   if (focus) passThrough = false;
   applyWindowMode(); fitWindow();
   if (win.isMinimized()) win.restore();
-  if (focus) { win.show(); win.focus(); emit({ type: 'focus-input' }); }
+  if (focus) { win.show(); win.focus(); }
   else win.showInactive();
   syncState();
+  if (focus) emit({ type: 'focus-input' });
 }
-function hideOverlay() { screenshotRestore = false; if (win && !win.isDestroyed()) win.hide(); updateTray(); }
-function toggleVisibility() { if (win?.isVisible()) hideOverlay(); else showOverlay(true); }
+function hideOverlay() {
+  screenshotRestore = false;
+  if (win && !win.isDestroyed()) { win.hide(); applyWindowMode(); }
+  syncState();
+}
+function toggleVisibility() { if (win?.isVisible()) hideOverlay(); else showOverlay(!platform.mac); }
 function togglePassThrough() {
   passThrough = !passThrough;
   applyWindowMode(); syncState();
-  if (!passThrough) showOverlay(true);
+  if (!passThrough) showOverlay(!platform.mac);
   return passThrough;
 }
 function saveGeometry() {
@@ -282,10 +294,17 @@ function createWindow() {
     ...clampBounds(saved, display.workArea, settings.compact), minWidth: 360, minHeight: settings.compact ? 122 : 440,
     title: 'Chat',
     frame: false, transparent: true, backgroundColor: '#00000000', show: false,
-    ...(platform.mac ? { type: 'panel', hiddenInMissionControl: true } : {}),
+    ...(platform.mac ? { type: 'panel', hiddenInMissionControl: true, acceptFirstMouse: true } : {}),
     alwaysOnTop: true, skipTaskbar: true, autoHideMenuBar: true, maximizable: false, fullscreenable: false,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), partition: 'overlay-memory', nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true, backgroundThrottling: true, spellcheck: false }
   });
+  if (platform.mac) {
+    try {
+      panelNative = require(path.join(__dirname, 'native/bin', `macos-panel-${process.arch}.node`));
+      panelBehavior = panelNative.configure(win.getNativeWindowHandle());
+      if (!panelBehavior.available || !panelBehavior.preventsActivation) warn('Native activation prevention is unavailable on this Mac. Browser focus preservation is best effort.');
+    } catch { warn('Native panel support is unavailable. Reinstall the Mac app to restore focus-preserving behavior.'); }
+  }
   // The app is already an accessory. Avoid process transformations that flash/hide the window.
   if (platform.mac) win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   applyWindowMode();
@@ -304,7 +323,14 @@ function createWindow() {
   win.on('session-end', allowSessionEnd);
   win.on('closed', () => { win = null; });
   win.on('move', saveGeometry); win.on('resize', saveGeometry);
-  if (platform.mac) win.on('focus', syncState);
+  if (platform.mac) for (const event of ['focus', 'blur']) win.on(event, () => {
+    if (quitting || !win || win.isDestroyed()) return;
+    if (panelNative) {
+      try { panelBehavior = panelNative.inspect(win.getNativeWindowHandle()); }
+      catch { log('panel-inspection-failed'); }
+    }
+    syncState();
+  });
   win.webContents.on('did-finish-load', () => syncState());
   win.webContents.on('did-fail-load', (_event, code) => { if (code !== -3) { warn('The overlay could not load. Quit and reopen from the tray.'); } });
   win.once('ready-to-show', () => { if (!testMode && !launchHidden) win.showInactive(); });
@@ -581,7 +607,7 @@ function registerShortcuts() {
     ['CommandOrControl+Alt+Space', 'Show / hide', toggleVisibility],
     ['CommandOrControl+Alt+I', 'Click-through', togglePassThrough],
     ['CommandOrControl+Alt+S', 'Screenshot', async () => {
-      try { if (draftImageIds.size >= MAX_IMAGES) throw new Error(`Attach up to ${MAX_IMAGES} images per question. Remove one before taking another screenshot.`); const image = await capture(); showOverlay(true); emit({ type: 'attach', image }); }
+      try { if (draftImageIds.size >= MAX_IMAGES) throw new Error(`Attach up to ${MAX_IMAGES} images per question. Remove one before taking another screenshot.`); const image = await capture(); showOverlay(!platform.mac); emit({ type: 'attach', image }); }
       catch (error) { showOverlay(false); emit({ type: 'notice', text: error.message }); }
     }]
   ];

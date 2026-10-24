@@ -42,6 +42,7 @@ private func diagnostic(_ message: String) {
 }
 
 private let debugEnabled = ProcessInfo.processInfo.environment["OPENCLUELY_RECOVERY_DEBUG"] == "1"
+private let reopenDelaySeconds: TimeInterval = 60
 private func debug(_ message: String) {
     if debugEnabled { diagnostic("debug: " + message) }
 }
@@ -53,11 +54,9 @@ private final class RecoverySupervisor {
     private var directorySource: DispatchSourceFileSystemObject?
     private var processSource: DispatchSourceProcess?
     private var watchedIdentity: ProcessIdentity?
-    private var watchStarted = Date()
     private var retryTimer: DispatchSourceTimer?
     private var handshakeTimer: DispatchSourceTimer?
     private var launcher: Process?
-    private var rapidFailures = 0
     private var exiting = false
 
     init(statePath: String, sessionId: String) {
@@ -155,12 +154,10 @@ private final class RecoverySupervisor {
         processSource?.cancel()
         processSource = nil
         watchedIdentity = identity
-        watchStarted = Date()
         let source = DispatchSource.makeProcessSource(identifier: identity.pid, eventMask: .exit, queue: queue)
         source.setEventHandler { [weak self] in
             guard let self, self.watchedIdentity == identity else { return }
             debug("GUI exit event pid \(identity.pid)")
-            if Date().timeIntervalSince(self.watchStarted) >= 60 { self.rapidFailures = 0 }
             self.watchedIdentity = nil
             self.processSource?.cancel()
             self.processSource = nil
@@ -179,7 +176,8 @@ private final class RecoverySupervisor {
 
     private func scheduleRetry() {
         guard retryTimer == nil, handshakeTimer == nil, launcher == nil else { return }
-        let delay = min(30.0, 2.0 * pow(2.0, Double(min(rapidFailures, 4))))
+        // Wait a full minute after each exit, including repeated startup failures.
+        let delay = reopenDelaySeconds
         debug("retry scheduled in \(delay) seconds")
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + delay, leeway: .milliseconds(250))
@@ -212,10 +210,9 @@ private final class RecoverySupervisor {
                 guard !self.exiting, self.launcher === finished else { return }
                 self.launcher = nil
                 if finished.terminationStatus != 0 {
-                    diagnostic("launch client exited with status \(finished.terminationStatus); retrying with backoff")
+                    diagnostic("launch client exited with status \(finished.terminationStatus); retrying in one minute")
                     self.handshakeTimer?.cancel()
                     self.handshakeTimer = nil
-                    self.rapidFailures = min(self.rapidFailures + 1, 4)
                 }
                 // A replacement can publish its PID and exit before `open`
                 // completes. Its exit handler waits for launcher, so clearing
@@ -227,7 +224,6 @@ private final class RecoverySupervisor {
         do {
             debug("requesting GUI launch")
             try task.run()
-            rapidFailures = min(rapidFailures + 1, 4)
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now() + 10, leeway: .milliseconds(250))
             timer.setEventHandler { [weak self] in
@@ -247,8 +243,7 @@ private final class RecoverySupervisor {
             timer.resume()
         } catch {
             launcher = nil
-            rapidFailures = min(rapidFailures + 1, 4)
-            diagnostic("launch failed; retrying with backoff")
+            diagnostic("launch failed; retrying in one minute")
             reconcile()
         }
     }
@@ -269,7 +264,7 @@ private final class RecoverySupervisor {
 
 private let args = Array(CommandLine.arguments.dropFirst())
 if args == ["--probe"] {
-    print("{\"version\":1,\"platform\":\"darwin\",\"processEvents\":true}")
+    print("{\"version\":1,\"platform\":\"darwin\",\"processEvents\":true,\"reopenDelaySeconds\":\(Int(reopenDelaySeconds))}")
 } else if args.count == 2, args[0] == "--process-identity", let pid = Int32(args[1]),
           let identity = processIdentity(pid), let data = try? JSONEncoder().encode(identity),
           let json = String(data: data, encoding: .utf8) {

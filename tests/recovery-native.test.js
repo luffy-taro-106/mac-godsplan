@@ -49,13 +49,13 @@ test('native helper reports process events and validates process identity', { sk
   assert.equal(compiled.status, 0, compiled.stderr);
   const probe = spawnSync(helper, ['--probe'], { encoding: 'utf8' });
   assert.equal(probe.status, 0);
-  assert.deepEqual(JSON.parse(probe.stdout), { version: 1, platform: 'darwin', processEvents: true });
+  assert.deepEqual(JSON.parse(probe.stdout), { version: 1, platform: 'darwin', processEvents: true, reopenDelaySeconds: 60 });
   const identity = spawnSync(helper, ['--process-identity', String(process.pid)], { encoding: 'utf8' });
   assert.equal(identity.status, 0);
   assert.equal(JSON.parse(identity.stdout).pid, process.pid);
 });
 
-test('native helper restarts an isolated app and exits when recovery is disabled', { skip: !mac, timeout: 45000 }, async t => {
+test('native helper waits one minute before each restart and exits when recovery is disabled', { skip: !mac, timeout: 170000 }, async t => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-recovery-native-'));
   fs.chmodSync(temp, 0o700);
   const bundle = path.join(temp, 'Recovery Fixture.app');
@@ -104,20 +104,26 @@ test('native helper restarts an isolated app and exits when recovery is disabled
   supervisor.stderr.on('data', chunk => { diagnostics += chunk; });
   await delay(500);
   assert.equal(supervisor.exitCode, null, diagnostics);
+  const firstExitAt = performance.now();
   killFixture(first.pid);
   const second = await until(() => {
     const state = readJSON(statePath);
     return state?.pid && state.pid !== first.pid && state;
-  });
+  }, 80000);
+  assert.ok(performance.now() - firstExitAt >= 60000, 'The first replacement must wait at least one minute');
+  t.diagnostic(`First reopening observed after ${((performance.now() - firstExitAt) / 1000).toFixed(2)} seconds`);
   fixturePids.add(second.pid);
   assert.equal(second.sessionId, sessionId);
   // Kill the replacement as soon as it publishes its PID, then require another
   // launch. This also exercises exit/PID updates near `open` completion.
+  const secondExitAt = performance.now();
   killFixture(second.pid);
   const third = await until(() => {
     const state = readJSON(statePath);
     return state?.pid && state.pid !== first.pid && state.pid !== second.pid && state;
-  }, 25000).catch(error => { throw new Error(`${error.message}\n${diagnostics}`); });
+  }, 80000).catch(error => { throw new Error(`${error.message}\n${diagnostics}`); });
+  assert.ok(performance.now() - secondExitAt >= 60000, 'A repeated exit must also wait at least one minute');
+  t.diagnostic(`Repeated reopening observed after ${((performance.now() - secondExitAt) / 1000).toFixed(2)} seconds`);
   fixturePids.add(third.pid);
   const events = await until(() => {
     const records = readEvents(eventPath);

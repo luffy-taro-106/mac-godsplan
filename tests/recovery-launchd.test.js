@@ -22,7 +22,7 @@ async function until(predicate, timeout = 18000) {
   throw new Error('Timed out waiting for the isolated launchd recovery job.');
 }
 
-test('launchd recovers helper and GUI, pause stops reopening, and next manual launch rearms it', { skip: process.platform !== 'darwin', timeout: 100000 }, async t => {
+test('launchd recovers helper and GUI, pause stops reopening, and next manual launch rearms it', { skip: process.platform !== 'darwin', timeout: 220000 }, async t => {
   const root = path.join(__dirname, '..');
   const sourceHelperPath = path.join(root, 'overlay', 'native', 'bin', `recovery-helper-${process.arch}`);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-launchd-test-'));
@@ -122,10 +122,14 @@ test('launchd recovers helper and GUI, pause stops reopening, and next manual la
   const helper2 = await until(async () => { const job = await jobInfo(); return job?.pid && job.pid !== helper1.pid && job; });
   assert.notEqual(helper2.pid, helper1.pid);
   assert.doesNotThrow(() => process.kill(first.pid, 0));
+  const firstExitAt = performance.now();
   await killOwned(first.pid, executablePath);
-  const second = await until(() => { const state = readJSON(statePath); return state?.pid !== first.pid && state?.pid && state; }, 25000); fixtures.add(second.pid);
+  const second = await until(() => { const state = readJSON(statePath); return state?.pid !== first.pid && state?.pid && state; }, 80000); fixtures.add(second.pid);
+  assert.ok(performance.now() - firstExitAt >= 60000, 'launchd recovery must wait at least one minute');
+  const secondExitAt = performance.now();
   await killOwned(second.pid, executablePath);
-  const third = await until(() => { const state = readJSON(statePath); return state?.pid !== second.pid && state?.pid && state; }, 25000); fixtures.add(third.pid);
+  const third = await until(() => { const state = readJSON(statePath); return state?.pid !== second.pid && state?.pid && state; }, 80000); fixtures.add(third.pid);
+  assert.ok(performance.now() - secondExitAt >= 60000, 'Repeated launchd recovery must also wait at least one minute');
   assert.equal(eventCount(), 3, 'Each kill should produce one replacement GUI');
   await recovery.disable();
   assert.equal(await jobInfo(), null);

@@ -16,6 +16,8 @@ Version 2.3.2 removes the overlay's logo, brand heading, tagline and welcome slo
 
 Version 2.3.4 supports **up to ten images per question** and adds fully independent **App opacity** and **Code box opacity** sliders. Code boxes can remain at 100% with the app at 10%, or fade to 10% with the app at 100%. Both settings are saved independently.
 
+Version 2.3.8 removes the Read/Type switch. The Mac overlay stays editable and applies native activation prevention to its own panel, so typing does not require activating the overlay application. Automatic reopening waits one minute. See [panel behavior, research and limits](docs/NONACTIVATING-PANEL.md).
+
 **Protect against normal Quit requests** remains enabled by default. External cooperative Quit requests are declined; quitting through OpenCluely asks for confirmation. Force termination can still interrupt the app; automatic reopening provides recovery afterward. See [close-protection details and checks](docs/CLOSE-PROTECTION.md).
 
 - Always-on-top overlay with tray controls, click-through, and global shortcuts.
